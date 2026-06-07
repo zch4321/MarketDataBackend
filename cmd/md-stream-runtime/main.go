@@ -6,8 +6,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -17,6 +19,7 @@ import (
 	"MarketDataBackend/internal/kafka"
 	"MarketDataBackend/internal/logging"
 	"MarketDataBackend/internal/metadata"
+	"MarketDataBackend/internal/observability"
 	"MarketDataBackend/internal/runtime"
 	"MarketDataBackend/internal/storage"
 )
@@ -116,9 +119,35 @@ func run() error {
 		},
 	)
 
-	logger.Info("md-stream-runtime started", "node_id", nodeID)
+	// M10: health / readiness / metrics server.
+	metricsReg := observability.NewRegistry(map[string]string{"service": "md-stream-runtime"})
+	readyCheck := func() error { return pool.Ping(ctx) }
+	healthMux := http.NewServeMux()
+	healthMux.Handle("/healthz", observability.HealthHandler())
+	healthMux.Handle("/readyz", observability.ReadinessHandler(readyCheck))
+	healthMux.Handle("/metrics", metricsReg.Handler())
+	healthServer := &http.Server{
+		Addr:    cfg.MetricsAddr,
+		Handler: healthMux,
+	}
+	go func() {
+		if err := healthServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("health server failed", "err", err)
+		}
+	}()
+
+	logger.Info("md-stream-runtime started",
+		"node_id", nodeID,
+		"metrics_addr", cfg.MetricsAddr,
+	)
 	if err := node.Run(ctx); err != nil {
 		return err
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancel()
+	if err := healthServer.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("health shutdown: %w", err)
 	}
 	logger.Info("md-stream-runtime stopped")
 	return nil

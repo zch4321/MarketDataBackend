@@ -1,0 +1,83 @@
+# K8s Deployment + Service for md-stream-runtime.
+# Runtime nodes auto-derive their node_id from POD_NAME (set via downward API).
+# They expose a single port for health/readiness/metrics (9090).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: md-stream-runtime
+  namespace: marketdata
+  labels:
+    app: md-stream-runtime
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: md-stream-runtime
+  template:
+    metadata:
+      labels:
+        app: md-stream-runtime
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: md-stream-runtime
+          image: your-registry/market-data-backend:latest
+          args: ["stream-runtime"]
+          ports:
+            - name: metrics
+              containerPort: 9090
+          envFrom:
+            - configMapRef:
+                name: md-backend-config
+          env:
+            - name: DATABASE_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: md-backend-secret
+                  key: DB_PASSWORD
+            - name: MODE
+              value: "stream-runtime"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RUNTIME_NODE_ID
+              value: "$(POD_NAMESPACE)/$(POD_NAME)"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9090
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9090
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: md-stream-runtime
+  namespace: marketdata
+  labels:
+    app: md-stream-runtime
+spec:
+  selector:
+    app: md-stream-runtime
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090

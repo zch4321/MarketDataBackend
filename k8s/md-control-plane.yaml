@@ -1,0 +1,80 @@
+# K8s Deployment + Service for md-control-plane.
+# The control-plane exposes two ports:
+#   8080 — REST API (groups, inputs, market-data queries)
+#   9090 — /healthz /readyz /metrics
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: md-control-plane
+  namespace: marketdata
+  labels:
+    app: md-control-plane
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: md-control-plane
+  template:
+    metadata:
+      labels:
+        app: md-control-plane
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: md-control-plane
+          image: your-registry/market-data-backend:latest
+          args: ["--config", "/etc/md-backend/config.yaml"]
+          ports:
+            - name: api
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          envFrom:
+            - configMapRef:
+                name: md-backend-config
+          env:
+            - name: DATABASE_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: md-backend-secret
+                  key: DB_PASSWORD
+            - name: MODE
+              value: "control-plane"
+          # We don't mount a config.yaml; the ConfigMap env vars are sufficient.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9090
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9090
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: md-control-plane
+  namespace: marketdata
+  labels:
+    app: md-control-plane
+spec:
+  selector:
+    app: md-control-plane
+  ports:
+    - name: api
+      port: 8080
+      targetPort: 8080
+    - name: metrics
+      port: 9090
+      targetPort: 9090

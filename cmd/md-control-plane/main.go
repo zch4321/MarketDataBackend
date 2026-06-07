@@ -18,6 +18,7 @@ import (
 	"MarketDataBackend/internal/db"
 	"MarketDataBackend/internal/logging"
 	"MarketDataBackend/internal/metadata"
+	"MarketDataBackend/internal/observability"
 	"MarketDataBackend/internal/storage"
 	"MarketDataBackend/migrations"
 )
@@ -84,23 +85,42 @@ func run() error {
 		return nil
 	}
 
-	logger.Info("md-control-plane started", "http_addr", cfg.HTTPAddr)
-
 	store := metadata.NewPostgresStore(pool)
 	queryStore := storage.NewPostgresStorage(pool)
 	server := api.New(store, queryStore, logger)
-	httpServer := &http.Server{
+
+	// M10: health / readiness / metrics server on the metrics port.
+	metricsReg := observability.NewRegistry(map[string]string{"service": "md-control-plane"})
+	readyCheck := func() error { return pool.Ping(ctx) }
+	healthMux := http.NewServeMux()
+	healthMux.Handle("/healthz", observability.HealthHandler())
+	healthMux.Handle("/readyz", observability.ReadinessHandler(readyCheck))
+	healthMux.Handle("/metrics", metricsReg.Handler())
+	healthServer := &http.Server{
+		Addr:    cfg.MetricsAddr,
+		Handler: healthMux,
+	}
+
+	apiServer := &http.Server{
 		Addr:    cfg.HTTPAddr,
 		Handler: server.Handler(),
 	}
 
-	serveErr := make(chan error, 1)
+	logger.Info("md-control-plane started",
+		"http_addr", cfg.HTTPAddr,
+		"metrics_addr", cfg.MetricsAddr,
+	)
+
+	serveErr := make(chan error, 2)
 	go func() {
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := apiServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
-			return
 		}
-		serveErr <- nil
+	}()
+	go func() {
+		if err := healthServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+		}
 	}()
 
 	select {
@@ -112,8 +132,11 @@ func run() error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("http shutdown: %w", err)
+	if err := apiServer.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("api shutdown: %w", err)
+	}
+	if err := healthServer.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("health shutdown: %w", err)
 	}
 	return nil
 }
