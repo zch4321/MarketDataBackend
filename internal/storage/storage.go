@@ -42,6 +42,9 @@ type MarketDataStorage interface {
 	WriteBookMetrics(ctx context.Context, rows []model.BookMetric) error
 	WriteCrossMetrics(ctx context.Context, rows []model.CrossMetric) error
 
+	// M10 dead-letter path.
+	WritePoisonRecord(ctx context.Context, record model.PoisonRecord) error
+
 	// M8 query methods.  All accept a mandatory time range [from, to).
 	// cursor is the exclusive lower bound for the next page (nil for the
 	// first page).  limit caps the number of rows (0 uses the default of 200).

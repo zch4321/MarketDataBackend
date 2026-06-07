@@ -8,6 +8,7 @@ import (
 
 	"MarketDataBackend/internal/kafka"
 	"MarketDataBackend/internal/model"
+	"MarketDataBackend/internal/observability"
 )
 
 // WorkerState is the lifecycle state of a MarketGroupWorker.
@@ -290,8 +291,10 @@ func (w *Worker) leaseLoop(ctx context.Context) (WorkerState, string, string) {
 					// Cancellation raced the renew; treat as a graceful stop.
 					return WorkerStopped, model.ActualStatusStopped, ""
 				}
+				observability.IncLeaseFailures()
 				return WorkerError, model.ActualStatusError, "renew lease: " + err.Error()
 			case !ok:
+				observability.IncLeaseFailures()
 				// Lost the lease to another node (or it expired). Stop so the
 				// group is not processed by two nodes at once.
 				return WorkerError, model.ActualStatusError, "lease lost"
@@ -421,14 +424,13 @@ func (w *Worker) snapshotReceiveLoop(ctx context.Context) {
 			if !ok {
 				return
 			}
-			// Apply the reference snapshot — this discards any previous
-			// state and re-initialises the order book.
+			// Apply the reference snapshot — orders are validated first.
+			// If validation fails the previous state is preserved.
 			if err := w.orderBook.applySnapshot(result.snapshot); err != nil {
-				w.logger.Warn("reference snapshot apply error",
+				w.logger.Warn("reference snapshot apply error — keeping previous state",
 					"group_id", w.group.GroupID, "err", err)
-				// The state is still replaced — continue.
 			}
-			w.logger.Info("reference snapshot applied",
+			w.logger.Debug("reference snapshot applied",
 				"group_id", w.group.GroupID, "sequence", ptrVal(result.snapshot.Sequence),
 				"bids", len(result.snapshot.Bids), "asks", len(result.snapshot.Asks))
 

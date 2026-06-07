@@ -91,6 +91,7 @@ func run() error {
 
 	// M10: health / readiness / metrics server on the metrics port.
 	metricsReg := observability.NewRegistry(map[string]string{"service": "md-control-plane"})
+	observability.SetGlobalRegistry(metricsReg)
 	readyCheck := func() error { return pool.Ping(ctx) }
 	healthMux := http.NewServeMux()
 	healthMux.Handle("/healthz", observability.HealthHandler())

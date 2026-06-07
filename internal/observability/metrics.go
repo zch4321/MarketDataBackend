@@ -80,6 +80,7 @@ type Registry struct {
 	counters   map[string]*Counter
 	gauges     map[string]*Gauge
 	histograms map[string]*Histogram
+	helps      map[string]string
 	start      time.Time
 	labels     map[string]string // static labels added to every metric
 }
@@ -91,6 +92,7 @@ func NewRegistry(labels map[string]string) *Registry {
 		counters:   make(map[string]*Counter),
 		gauges:     make(map[string]*Gauge),
 		histograms: make(map[string]*Histogram),
+		helps:      make(map[string]string),
 		start:      time.Now(),
 		labels:     labels,
 	}
@@ -105,6 +107,7 @@ func (r *Registry) Counter(name, help string) *Counter {
 	}
 	c := &Counter{}
 	r.counters[name] = c
+	r.helps[name] = help
 	return c
 }
 
@@ -117,6 +120,7 @@ func (r *Registry) Gauge(name, help string) *Gauge {
 	}
 	g := &Gauge{}
 	r.gauges[name] = g
+	r.helps[name] = help
 	return g
 }
 
@@ -129,6 +133,7 @@ func (r *Registry) Histogram(name, help string, buckets []float64) *Histogram {
 	}
 	h := NewHistogram(buckets)
 	r.histograms[name] = h
+	r.helps[name] = help
 	return h
 }
 
@@ -162,19 +167,22 @@ func (r *Registry) serveMetrics(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	for _, name := range counters {
-		fmt.Fprintf(w, "# HELP %s (counter)\n", name)
+		help := r.helps[name]
+		fmt.Fprintf(w, "# HELP %s %s\n", name, help)
 		fmt.Fprintf(w, "# TYPE %s counter\n", name)
 		fmt.Fprintf(w, "%s%s %d\n", name, labels, r.counters[name].Value())
 	}
 	for _, name := range gauges {
-		fmt.Fprintf(w, "# HELP %s (gauge)\n", name)
+		help := r.helps[name]
+		fmt.Fprintf(w, "# HELP %s %s\n", name, help)
 		fmt.Fprintf(w, "# TYPE %s gauge\n", name)
 		fmt.Fprintf(w, "%s%s %d\n", name, labels, r.gauges[name].Value())
 	}
 	for _, name := range histograms {
 		h := r.histograms[name]
 		h.mu.Lock()
-		fmt.Fprintf(w, "# HELP %s (histogram)\n", name)
+		help := r.helps[name]
+		fmt.Fprintf(w, "# HELP %s %s\n", name, help)
 		fmt.Fprintf(w, "# TYPE %s histogram\n", name)
 		for i, upper := range h.buckets {
 			le := fmt.Sprintf(`%s_bucket%s,le="%g"`, name, labels, upper)
@@ -252,10 +260,72 @@ const (
 )
 
 // toFloat64Seconds returns seconds as a float64, clamping NaN/Inf to 0.
+// Used by ObservedWriteLatencyMs (B1 metrics integration) to convert durations.
 func toFloat64Seconds(d time.Duration) float64 {
 	s := d.Seconds()
 	if math.IsNaN(s) || math.IsInf(s, 0) {
 		return 0
 	}
 	return s
+}
+
+// ---------------------------------------------------------------------------
+// Global registry — convenience methods so business code can record metrics
+// without threading a *Registry through every constructor.
+// ---------------------------------------------------------------------------
+
+var globalRegistry *Registry
+
+// SetGlobalRegistry installs the process-wide registry created in main.
+// Must be called once before any metric recording.
+func SetGlobalRegistry(r *Registry) { globalRegistry = r }
+
+// IncProcessedTotal increments the total processed messages counter by n.
+func IncProcessedTotal(n int64) {
+	if globalRegistry == nil {
+		return
+	}
+	globalRegistry.Counter(MetricProcessedTotal, "Total number of messages decoded and persisted").Add(n)
+}
+
+// IncWriteErrors increments the write errors counter.
+func IncWriteErrors() {
+	if globalRegistry == nil {
+		return
+	}
+	globalRegistry.Counter(MetricWriteErrorsTotal, "Total number of database write failures").Inc()
+}
+
+// IncDecodeErrors increments the decode errors counter.
+func IncDecodeErrors() {
+	if globalRegistry == nil {
+		return
+	}
+	globalRegistry.Counter(MetricDecodeErrorsTotal, "Total number of message decode/validation failures").Inc()
+}
+
+// IncLeaseFailures increments the lease renewal failure counter.
+func IncLeaseFailures() {
+	if globalRegistry == nil {
+		return
+	}
+	globalRegistry.Counter(MetricLeaseFailures, "Total number of group lease renewal failures").Inc()
+}
+
+// ObserveWriteLatencyMs records a storage write latency observation in milliseconds.
+func ObserveWriteLatencyMs(ms float64) {
+	if globalRegistry == nil {
+		return
+	}
+	globalRegistry.
+		Histogram(MetricStorageWriteLatency, "Database write latency in milliseconds", DefaultLatencyBuckets).
+		Observe(ms)
+}
+
+// SetOwnedGroups sets the gauge for the number of groups currently owned by this runtime.
+func SetOwnedGroups(n int64) {
+	if globalRegistry == nil {
+		return
+	}
+	globalRegistry.Gauge(MetricOwnedGroups, "Number of MarketGroups currently owned by this runtime").Set(n)
 }

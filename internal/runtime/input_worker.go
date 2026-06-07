@@ -12,12 +12,20 @@ import (
 
 	"MarketDataBackend/internal/kafka"
 	"MarketDataBackend/internal/model"
+	"MarketDataBackend/internal/observability"
 	"MarketDataBackend/internal/storage"
 )
 
 // writeBackoff is how long an input worker waits before retrying after a write
 // or commit failure, so a struggling dependency is not hammered in a tight loop.
 const writeBackoff = 200 * time.Millisecond
+
+// isRetryableStage returns true for stages that should not enter the dead-letter
+// path but instead preserve the offset for at-least-once delivery (e.g. sequence
+// gaps that may heal after a reference snapshot).
+func isRetryableStage(stage string) bool {
+	return stage == "sequence" || stage == "durable"
+}
 
 // statusReporter is the subset of the metadata store an input worker needs to
 // publish its observed runtime status.
@@ -31,6 +39,7 @@ type factWriter interface {
 		ctx context.Context, inputID string, partition int,
 	) (model.StreamWriteProgress, bool, error)
 	WriteOrderBookSnapshots(ctx context.Context, rows []model.OrderBookSnapshot) error
+	WritePoisonRecord(ctx context.Context, record model.PoisonRecord) error
 }
 
 // BatchConfig controls one stream kind's per-input batch.
@@ -221,6 +230,8 @@ func (iw *inputWorker) consume(ctx context.Context) {
 
 		record, stage, err := iw.prepare(msg)
 		if err != nil {
+			// Flush any pending batch first so preceding valid messages
+			// are persisted.
 			if len(pending) > 0 {
 				if !iw.flushBatch(ctx, pending) {
 					return
@@ -228,12 +239,42 @@ func (iw *inputWorker) consume(ctx context.Context) {
 				pending = nil
 				pendingSince = time.Time{}
 			}
+
+			// Distinguish between unrecoverable decode/validation failures
+			// (dead-letter) and semantic gaps (sequence / durability) that
+			// must be kept uncommitted for at-least-once safety.
+			if !isRetryableStage(stage) {
+				// M10 dead-letter path: persist the raw record for audit,
+				// then commit the offset so the runtime can continue.
+				iw.setStatus(model.ActualStatusError, stage+": "+err.Error())
+				iw.logger.Warn(stage+" failed; poison record persisted and skipped",
+					"input_id", inputID(iw.input), "stream_kind", iw.input.StreamKind,
+					"offset", msg.Offset, "err", err)
+				observability.IncDecodeErrors()
+				_ = iw.storage.WritePoisonRecord(ctx, model.PoisonRecord{
+					InputID:      inputID(iw.input),
+					GroupID:      iw.group.GroupID,
+					StreamKind:   iw.input.StreamKind,
+					Partition:    msg.Partition,
+					Offset:       msg.Offset,
+					ErrorMessage: stage + ": " + err.Error(),
+					RawPayload:   msg.Value,
+				})
+				if err := iw.consumer.Commit(ctx, msg); err != nil {
+					iw.logger.Warn("commit poison offset failed",
+						"offset", msg.Offset, "err", err)
+				}
+				continue
+			}
+
+			// Retryable stage (e.g. sequence gap): preserve at-least-once by
+			// keeping the offset uncommitted. The worker stops so the gap can
+			// be observed and the runtime can recover via a new reference
+			// snapshot.
 			iw.setStatus(model.ActualStatusError, stage+": "+err.Error())
 			iw.logger.Warn(stage+" failed; record left uncommitted",
 				"input_id", inputID(iw.input), "stream_kind", iw.input.StreamKind,
 				"offset", msg.Offset, "err", err)
-			// M7 still has no dead-letter path. Preserve at-least-once by
-			// keeping poison records and sequence gaps uncommitted.
 			<-ctx.Done()
 			return
 		}
@@ -399,6 +440,7 @@ func (iw *inputWorker) flushBatch(ctx context.Context, records []pendingRecord) 
 		batch.Progress.LastSequence = cursor.Sequence
 	}
 
+	writeStart := time.Now()
 	for {
 		if err := iw.storage.WriteFactBatch(ctx, batch); err != nil {
 			if ctx.Err() != nil {
@@ -408,6 +450,7 @@ func (iw *inputWorker) flushBatch(ctx context.Context, records []pendingRecord) 
 			iw.logger.Warn("batch write failed; retrying without committing",
 				"input_id", inputID(iw.input), "records", len(records),
 				"offset", last.msg.Offset, "err", err)
+			observability.IncWriteErrors()
 			if !sleepCtx(ctx, writeBackoff) {
 				return false
 			}
@@ -415,6 +458,8 @@ func (iw *inputWorker) flushBatch(ctx context.Context, records []pendingRecord) 
 		}
 		break
 	}
+	observability.IncProcessedTotal(int64(len(records)))
+	observability.ObserveWriteLatencyMs(float64(time.Since(writeStart).Milliseconds()))
 
 	for {
 		if err := iw.consumer.Commit(ctx, last.msg); err != nil {

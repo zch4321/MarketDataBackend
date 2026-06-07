@@ -314,3 +314,18 @@ type CrossMetric struct {
 	MetricVersion int
 	ComputedAt    time.Time
 }
+
+// PoisonRecord is a Kafka message that could not be decoded or validated.
+// It is persisted atomically so the runtime can safely skip the offset without
+// losing visibility of the problematic payload (M10 dead-letter path).
+type PoisonRecord struct {
+	InputID      string
+	GroupID      string
+	StreamKind   string
+	Topic        string
+	Partition    int
+	Offset       int64
+	ErrorMessage string
+	RawPayload   []byte
+	RecordedAt   time.Time // set by the database layer (DEFAULT now())
+}

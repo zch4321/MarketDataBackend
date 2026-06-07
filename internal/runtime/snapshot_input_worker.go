@@ -13,6 +13,7 @@ import (
 
 	"MarketDataBackend/internal/kafka"
 	"MarketDataBackend/internal/model"
+	"MarketDataBackend/internal/observability"
 )
 
 // snapshotResult holds a decoded reference snapshot for one Kafka message.
@@ -90,11 +91,17 @@ func (sw *snapshotInputWorker) run(ctx context.Context) {
 		snap, err := buildOrderBookSnapshot(sw.input, msg)
 		if err != nil {
 			sw.setStatus(model.ActualStatusError, "decode: "+err.Error())
-			sw.logger.Warn("snapshot decode failed; record left uncommitted",
+			sw.logger.Warn("snapshot decode failed; record skipped",
 				"input_id", inputID(sw.input), "offset", msg.Offset, "err", err)
-			// Don't commit — wait for the next valid snapshot.
-			<-ctx.Done()
-			return
+			observability.IncDecodeErrors()
+			// Don't block the whole worker — skip this poison record and
+			// continue fetching.  The offset stays uncommitted, so at-least-once
+			// will retry it; if it's a persistent format change, the adapter
+			// must be fixed.
+			if !sleepCtx(ctx, writeBackoff) {
+				return
+			}
+			continue
 		}
 
 		sw.mu.Lock()

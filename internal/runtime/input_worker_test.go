@@ -132,6 +132,12 @@ func (w *scriptedFactWriter) WriteOrderBookSnapshots(
 	return nil
 }
 
+func (w *scriptedFactWriter) WritePoisonRecord(
+	_ context.Context, _ model.PoisonRecord,
+) error {
+	return nil
+}
+
 func progressKey(inputID string, partition int) string {
 	return fmt.Sprintf("%s/%d", inputID, partition)
 }
@@ -324,7 +330,9 @@ func TestInputWorkerDoesNotCommitPersistentWriteFailure(t *testing.T) {
 	}
 }
 
-func TestInputWorkerLeavesDecodeErrorUncommitted(t *testing.T) {
+// TestInputWorkerDecodeErrorGoesToDeadLetter verifies that a decode error
+// is persisted as a poison record and its offset committed (M10 dead-letter).
+func TestInputWorkerDecodeErrorGoesToDeadLetter(t *testing.T) {
 	msg := validTradeMessage(7)
 	msg.Value = []byte(`{"event_time":1,"price":"bad","quantity":"1","side":"buy"}`)
 	consumer := &scriptedConsumer{messages: []kafka.Message{msg}}
@@ -333,16 +341,20 @@ func TestInputWorkerLeavesDecodeErrorUncommitted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go iw.run(ctx)
 
+	// The worker processes the poison, commits the offset, and continues.
+	// Wait for the error state to appear.
 	waitFor(t, time.Second, func() bool {
-		return iw.snapshot(model.ActualStatusError, "").CommittedOffset == nil &&
-			iw.StateForTest() == model.ActualStatusError
-	}, "decode error should become visible")
+		return iw.StateForTest() == model.ActualStatusError
+	}, "decode error should be visible")
+	_ = cancel // stop the worker
 	stopInputWorker(t, cancel, iw)
 
 	_, commits, _ := consumer.counts()
 	calls, _ := writer.tradeSnapshot()
-	if commits != 0 || calls != 0 {
-		t.Errorf("commits/writes = %d/%d, want 0/0", commits, calls)
+	// The dead-letter path commits the poison offset, but never writes
+	// a fact batch because decode failed.
+	if commits != 1 || calls != 0 {
+		t.Errorf("commits/writes = %d/%d, want 1/0", commits, calls)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 
 	"MarketDataBackend/internal/kafka"
 	"MarketDataBackend/internal/model"
+	"MarketDataBackend/internal/observability"
 	"MarketDataBackend/internal/storage"
 )
 
@@ -253,6 +254,7 @@ func (n *Node) reconcileOnce(ctx context.Context) {
 			currentWeight += weight
 		}
 	}
+	observability.SetOwnedGroups(int64(len(n.runningGroupIDs())))
 }
 
 // tryStartWorker acquires the lease for a group and, on success, starts a worker

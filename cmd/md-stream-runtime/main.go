@@ -121,6 +121,7 @@ func run() error {
 
 	// M10: health / readiness / metrics server.
 	metricsReg := observability.NewRegistry(map[string]string{"service": "md-stream-runtime"})
+	observability.SetGlobalRegistry(metricsReg)
 	readyCheck := func() error { return pool.Ping(ctx) }
 	healthMux := http.NewServeMux()
 	healthMux.Handle("/healthz", observability.HealthHandler())

@@ -363,6 +363,25 @@ func (s *PostgresStorage) WriteOrderBookSnapshots(ctx context.Context, rows []mo
 	return s.exec(ctx, batch, "write orderbook snapshots")
 }
 
+// WritePoisonRecord persists a Kafka record that could not be decoded or
+// validated, so the runtime can skip its offset without losing auditability.
+func (s *PostgresStorage) WritePoisonRecord(ctx context.Context, record model.PoisonRecord) error {
+	const q = `INSERT INTO stream_poison_records
+		(input_id, group_id, stream_kind, kafka_partition, kafka_offset, error_message, raw_payload)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT DO NOTHING`
+	_, err := s.pool.Exec(ctx, q,
+		record.InputID, record.GroupID, record.StreamKind,
+		record.Partition, record.Offset,
+		record.ErrorMessage, record.RawPayload,
+	)
+	if err != nil {
+		return fmt.Errorf("storage: write poison record (input=%s offset=%d): %w",
+			record.InputID, record.Offset, err)
+	}
+	return nil
+}
+
 // WriteTradeMetrics is implemented in M9.
 func (s *PostgresStorage) WriteTradeMetrics(ctx context.Context, rows []model.TradeMetric) error {
 	return ErrNotImplemented
@@ -656,15 +675,25 @@ func (s *PostgresStorage) QueryTrades(
 	var result QueryResult[model.Trade]
 	for rows.Next() {
 		var t model.Trade
+		var (
+			tradeID    *string
+			rawTradeID *string
+		)
 		if err := rows.Scan(
 			&t.GroupID, &t.InputID, &t.EventTime, &t.ExchangeTime,
-			&t.LocalReceiveTime, &t.TradeID, &t.RawTradeID,
+			&t.LocalReceiveTime, &tradeID, &rawTradeID,
 			&t.Price, &t.Quantity, &t.Side, &t.IsAggregated,
 			&t.KafkaTopic, &t.KafkaPartition, &t.KafkaOffset,
 			&t.SchemaVersion, &t.IngestedAt,
 		); err != nil {
 			return QueryResult[model.Trade]{},
 				fmt.Errorf("storage: query trades: scan: %w", err)
+		}
+		if tradeID != nil {
+			t.TradeID = *tradeID
+		}
+		if rawTradeID != nil {
+			t.RawTradeID = *rawTradeID
 		}
 		result.Rows = append(result.Rows, t)
 	}

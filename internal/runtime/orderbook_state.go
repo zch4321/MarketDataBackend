@@ -54,37 +54,37 @@ func newOrderBookState(groupID, snapInput string) *orderBookState {
 // --- public surface used by the group worker -----------------------------
 
 // applySnapshot initialises the order book from a complete reference snapshot.
-// Any existing state is discarded. Returns an error if the snapshot's bids or
-// asks are not correctly ordered (bids descending, asks ascending), but the
-// state is still replaced — callers should treat an error as a signal to
-// inspect, not a blocker.
+// Any existing state is discarded.  Validation runs before the state is
+// replaced, so an ordering violation in the upstream snapshot does not
+// overwrite a previously valid book.
 func (s *orderBookState) applySnapshot(snap model.OrderBookSnapshot) error {
-	s.bids = make(map[string]string, len(snap.Bids))
-	s.asks = make(map[string]string, len(snap.Asks))
-	s.lastUpdateID = nil
-	s.sequence = nil
+	// Validate first, so a malformed snapshot never replaces valid state.
+	if err := validateBidAskOrder(snap.Bids, snap.Asks); err != nil {
+		return fmt.Errorf("orderbook state: snapshot ordering: %w", err)
+	}
+
+	bids := make(map[string]string, len(snap.Bids))
+	asks := make(map[string]string, len(snap.Asks))
 
 	for _, level := range snap.Bids {
 		if level.Quantity == "0" || level.Quantity == "0.0" {
 			continue
 		}
-		s.bids[level.Price] = level.Quantity
+		bids[level.Price] = level.Quantity
 	}
 	for _, level := range snap.Asks {
 		if level.Quantity == "0" || level.Quantity == "0.0" {
 			continue
 		}
-		s.asks[level.Price] = level.Quantity
+		asks[level.Price] = level.Quantity
 	}
 
+	s.bids = bids
+	s.asks = asks
+	s.lastUpdateID = nil
 	s.sequence = snap.Sequence
 	s.inputID = snap.InputID
 	s.ready = true
-
-	// Validate that the snapshot's ordering conforms to the contract.
-	if err := validateBidAskOrder(snap.Bids, snap.Asks); err != nil {
-		return fmt.Errorf("orderbook state: snapshot ordering: %w", err)
-	}
 	return nil
 }
 
@@ -127,13 +127,14 @@ func (s *orderBookState) reset() {
 // generateSnapshot creates a full-depth snapshot at the given time. Bids are
 // sorted descending, asks ascending. Only non-zero levels are included.
 // Returns an empty snapshot when not ready.
+// CreatedAt is left at its zero value — the database layer fills it via
+// DEFAULT now() for consistency with the rest of the table.
 func (s *orderBookState) generateSnapshot(at time.Time) model.OrderBookSnapshot {
 	snap := model.OrderBookSnapshot{
 		GroupID:      s.groupID,
 		InputID:      s.inputID,
 		SnapshotTime: at,
 		Sequence:     copyInt64Ptr(s.sequence),
-		CreatedAt:    at,
 	}
 	if !s.ready {
 		// Not ready: return an empty snapshot that the caller can skip.
