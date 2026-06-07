@@ -1,0 +1,39 @@
+package storage
+
+import (
+	"context"
+	"errors"
+
+	"MarketDataBackend/internal/model"
+)
+
+// ErrNotImplemented is returned by the derived-metric write paths until M9.
+var ErrNotImplemented = errors.New("storage: not implemented")
+
+// FactBatch contains one input/partition's highest contiguous validated Kafka
+// prefix. Progress is committed atomically with all included facts.
+type FactBatch struct {
+	Trades          []model.Trade
+	Klines          []model.Kline
+	OrderBookDeltas []model.OrderBookDelta
+	Progress        model.StreamWriteProgress
+}
+
+// MarketDataStorage writes normalized market-data facts and derived metrics.
+type MarketDataStorage interface {
+	WriteFactBatch(ctx context.Context, batch FactBatch) error
+	LoadStreamWriteProgress(
+		ctx context.Context, inputID string, partition int,
+	) (model.StreamWriteProgress, bool, error)
+
+	WriteTrades(ctx context.Context, rows []model.Trade) error
+	WriteKlines(ctx context.Context, rows []model.Kline) error
+	WriteOrderBookDeltas(ctx context.Context, rows []model.OrderBookDelta) error
+	WriteOrderBookSnapshots(ctx context.Context, rows []model.OrderBookSnapshot) error
+
+	WriteTradeMetrics(ctx context.Context, rows []model.TradeMetric) error
+	WriteBookMetrics(ctx context.Context, rows []model.BookMetric) error
+	WriteCrossMetrics(ctx context.Context, rows []model.CrossMetric) error
+
+	Close() error
+}

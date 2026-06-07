@@ -1,0 +1,66 @@
+# Example configuration for md-control-plane and md-stream-runtime.
+#
+# Copy to ./config.yaml and adjust. Values here are overridden by environment
+# variables, so secrets (the database password) should NOT be written inline.
+# Instead reference them with ${VAR}; the value is taken from the environment or
+# a .env file at startup. You can also bypass this file entirely and set the
+# matching env vars (MODE, DATABASE_DSN, LEASE_TTL, ...).
+#
+# Precedence (low -> high):  defaults  <  this file  <  environment variables
+
+# control-plane | stream-runtime (usually set per-binary via MODE env instead).
+mode: control-plane
+
+server:
+  http_addr: ":8080"
+  metrics_addr: ":9090"
+
+database:
+  # ${DB_PASSWORD} is expanded from the environment / .env at load time, so the
+  # password never lives in this committed file. Alternatively set DATABASE_DSN
+  # in the environment to override this whole value.
+  dsn: "postgres://marketdata:${DB_PASSWORD}@127.0.0.1:55432/marketdata?sslmode=disable"
+  max_conns: 10
+  min_conns: 0
+  connect_timeout: 5s
+
+kafka_clusters:
+  default:
+    brokers:
+      - "127.0.0.1:19092"
+
+runtime:
+  # Leave node_id empty to auto-derive from POD_NAME / hostname at startup.
+  node_id: ""
+  max_groups: 10
+  max_weight: 100
+  lease_ttl: 30s
+  lease_renew_interval: 10s
+  reconcile_interval: 5s
+  heartbeat_interval: 10s
+  shutdown_timeout: 20s
+
+processing:
+  status_report_interval: 1s
+  input_reconcile_interval: 2s
+  batch:
+    trade:
+      size: 500
+      flush_interval: 100ms
+    kline:
+      size: 100
+      flush_interval: 500ms
+    orderbook_delta:
+      size: 2000
+      flush_interval: 100ms
+  orderbook:
+    # Consumed by the M8 full-book snapshot worker.
+    snapshot_interval: 1m
+    delta_retention: 72h
+    delta_partition_interval: 1h
+    partition_maintenance_interval: 1h
+    partition_precreate_horizon: 3h
+
+log:
+  level: info
+  format: json

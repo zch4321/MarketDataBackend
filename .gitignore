@@ -1,0 +1,22 @@
+# Local configuration and secrets — never commit these.
+.env
+.env.*
+!.env.example
+/config.yaml
+/config.local.yaml
+
+# Build output
+/bin/
+*.exe
+*.test
+
+# Go coverage / profiling
+.gocache/
+*.out
+coverage.*
+
+# OS / editor cruft
+.codewhale/
+.idea/
+.DS_Store
+Thumbs.db
