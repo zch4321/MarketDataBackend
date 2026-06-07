@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"time"
 
 	"MarketDataBackend/internal/model"
 )
@@ -17,6 +18,12 @@ type FactBatch struct {
 	Klines          []model.Kline
 	OrderBookDeltas []model.OrderBookDelta
 	Progress        model.StreamWriteProgress
+}
+
+// QueryResult wraps a page of results and a cursor for the next page.
+type QueryResult[T any] struct {
+	Rows       []T
+	NextCursor *time.Time // nil when there are no more pages
 }
 
 // MarketDataStorage writes normalized market-data facts and derived metrics.
@@ -34,6 +41,22 @@ type MarketDataStorage interface {
 	WriteTradeMetrics(ctx context.Context, rows []model.TradeMetric) error
 	WriteBookMetrics(ctx context.Context, rows []model.BookMetric) error
 	WriteCrossMetrics(ctx context.Context, rows []model.CrossMetric) error
+
+	// M8 query methods.  All accept a mandatory time range [from, to).
+	// cursor is the exclusive lower bound for the next page (nil for the
+	// first page).  limit caps the number of rows (0 uses the default of 200).
+	QueryTrades(
+		ctx context.Context, groupID string, from, to time.Time,
+		limit int, cursor *time.Time,
+	) (QueryResult[model.Trade], error)
+	QueryKlines(
+		ctx context.Context, groupID string, from, to time.Time,
+		limit int, cursor *time.Time,
+	) (QueryResult[model.Kline], error)
+	QuerySnapshots(
+		ctx context.Context, groupID string, from, to time.Time,
+		limit int, cursor *time.Time,
+	) (QueryResult[model.OrderBookSnapshot], error)
 
 	Close() error
 }

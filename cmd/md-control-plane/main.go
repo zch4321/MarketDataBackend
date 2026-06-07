@@ -18,6 +18,7 @@ import (
 	"MarketDataBackend/internal/db"
 	"MarketDataBackend/internal/logging"
 	"MarketDataBackend/internal/metadata"
+	"MarketDataBackend/internal/storage"
 	"MarketDataBackend/migrations"
 )
 
@@ -86,7 +87,8 @@ func run() error {
 	logger.Info("md-control-plane started", "http_addr", cfg.HTTPAddr)
 
 	store := metadata.NewPostgresStore(pool)
-	server := api.New(store, logger)
+	queryStore := storage.NewPostgresStorage(pool)
+	server := api.New(store, queryStore, logger)
 	httpServer := &http.Server{
 		Addr:    cfg.HTTPAddr,
 		Handler: server.Handler(),

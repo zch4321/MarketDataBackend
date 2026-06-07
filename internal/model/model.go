@@ -269,13 +269,13 @@ type StreamWriteProgress struct {
 }
 
 // OrderBookSnapshot is a point-in-time order book fact row. bids are stored in
-// descending price order, asks ascending.
+// descending price order, asks ascending. depth_limit was removed in M8 (migration
+// 000005); internally-generated snapshots are always full-depth.
 type OrderBookSnapshot struct {
 	GroupID      string
 	InputID      string
 	SnapshotTime time.Time
 	Sequence     *int64
-	DepthLimit   *int
 	Bids         []PriceLevel
 	Asks         []PriceLevel
 	CreatedAt    time.Time

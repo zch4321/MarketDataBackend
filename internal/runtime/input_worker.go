@@ -30,6 +30,7 @@ type factWriter interface {
 	LoadStreamWriteProgress(
 		ctx context.Context, inputID string, partition int,
 	) (model.StreamWriteProgress, bool, error)
+	WriteOrderBookSnapshots(ctx context.Context, rows []model.OrderBookSnapshot) error
 }
 
 // BatchConfig controls one stream kind's per-input batch.
@@ -56,6 +57,7 @@ type ConsumptionConfig struct {
 	TradeBatch          BatchConfig
 	KlineBatch          BatchConfig
 	OrderBookDeltaBatch BatchConfig
+	SnapshotInterval    time.Duration // M8: interval between local full-depth snapshots
 }
 
 func (c ConsumptionConfig) batchFor(kind string) BatchConfig {
@@ -93,6 +95,10 @@ type inputWorker struct {
 	batch       BatchConfig
 	logger      *slog.Logger
 	flushOnStop atomic.Bool
+
+	// onDeltaApplied is called for each successfully persisted delta (M8).
+	// It must be brief and non-blocking.
+	onDeltaApplied func(delta model.OrderBookDelta)
 
 	mu        sync.Mutex
 	status    string
@@ -435,6 +441,14 @@ func (iw *inputWorker) flushBatch(ctx context.Context, records []pendingRecord) 
 			break
 		}
 	}
+	// M8: notify orderBookState about each persisted delta.
+	if iw.onDeltaApplied != nil && iw.input.StreamKind == model.StreamKindOrderBookDelta {
+		for _, record := range records {
+			if record.delta != nil {
+				iw.onDeltaApplied(*record.delta)
+			}
+		}
+	}
 	iw.advance(last.msg, eventTime)
 	iw.setStatus(model.ActualStatusRunning, "")
 	return true
@@ -559,7 +573,8 @@ type inputManager struct {
 
 type managedInput struct {
 	in     model.GroupInput
-	iw     *inputWorker
+	iw     *inputWorker         // non-nil for fact streams
+	sw     *snapshotInputWorker // non-nil for orderbook_snapshot
 	cancel context.CancelFunc
 	done   <-chan struct{}
 }
@@ -661,7 +676,9 @@ func (m *inputManager) reconcile(ctx context.Context) {
 	}
 }
 
-// startInput creates a consumer and inputWorker for one supported input.
+// startInput creates a consumer and the appropriate worker for one supported
+// input. Fact streams (trade/kline/delta) get an inputWorker with batch writes;
+// orderbook_snapshot gets a lightweight snapshotInputWorker.
 func (m *inputManager) startInput(parent context.Context, in model.GroupInput) {
 	if in.KafkaCluster != "" && in.KafkaCluster != "default" {
 		m.reportStartError(in, "unsupported kafka cluster "+in.KafkaCluster)
@@ -681,21 +698,39 @@ func (m *inputManager) startInput(parent context.Context, in model.GroupInput) {
 	}
 
 	ctx, cancel := context.WithCancel(parent)
-	iw := newInputWorker(m.w.group, in, consumer, m.w.storage, m.w.store,
-		m.w.nodeID, m.w.statusReportEvery,
-		m.w.consumptionConfig.batchFor(in.StreamKind), m.w.logger)
-	go iw.run(ctx)
+	var mi = managedInput{in: in, cancel: cancel}
+
+	if in.StreamKind == model.StreamKindOrderBookSnapshot {
+		sw := newSnapshotInputWorker(m.w.group, in, consumer,
+			m.w.snapshotChan, m.w.nodeID, m.w.logger)
+		go sw.run(ctx)
+		mi.sw = sw
+		mi.done = sw.done
+	} else {
+		iw := newInputWorker(m.w.group, in, consumer, m.w.storage, m.w.store,
+			m.w.nodeID, m.w.statusReportEvery,
+			m.w.consumptionConfig.batchFor(in.StreamKind), m.w.logger)
+		// M8: hook delta application into the orderBookState.
+		if in.StreamKind == model.StreamKindOrderBookDelta && m.w.orderBook != nil {
+			iw.onDeltaApplied = m.w.onDeltaApplied
+		}
+		go iw.run(ctx)
+		mi.iw = iw
+		mi.done = iw.done
+	}
 
 	m.mu.Lock()
-	m.active[inputID(in)] = &managedInput{in: in, iw: iw, cancel: cancel, done: iw.done}
+	m.active[inputID(in)] = &mi
 	m.mu.Unlock()
 	m.w.logger.Info("input worker started",
-		"group_id", m.w.group.GroupID, "input_id", inputID(in), "topic", in.KafkaTopic)
+		"group_id", m.w.group.GroupID, "input_id", inputID(in),
+		"stream_kind", in.StreamKind, "topic", in.KafkaTopic)
 }
 
 func isConsumableStreamKind(kind string) bool {
 	switch kind {
-	case model.StreamKindTrade, model.StreamKindKline, model.StreamKindOrderBookDelta:
+	case model.StreamKindTrade, model.StreamKindKline, model.StreamKindOrderBookDelta,
+		model.StreamKindOrderBookSnapshot:
 		return true
 	default:
 		return false
@@ -744,16 +779,24 @@ func (m *inputManager) stopInput(id string, reportPause, flush bool) {
 	if mi == nil {
 		return
 	}
-	mi.iw.flushOnStop.Store(flush)
+	if mi.iw != nil {
+		mi.iw.flushOnStop.Store(flush)
+	}
 	mi.cancel()
 	<-mi.done
 	if reportPause {
 		ctx, cancel := context.WithTimeout(context.Background(), reportTimeout)
-		st := mi.iw.snapshot(model.ActualStatusPaused, "")
+		defer cancel()
+		var st model.StreamRuntimeStatus
+		if mi.iw != nil {
+			st = mi.iw.snapshot(model.ActualStatusPaused, "")
+		} else if mi.sw != nil {
+			st = mi.sw.snapshot()
+			st.ActualStatus = model.ActualStatusPaused
+		}
 		if err := m.w.store.ReportStreamRuntimeStatus(ctx, st); err != nil {
 			m.w.logger.Warn("report paused status failed", "input_id", id, "err", err)
 		}
-		cancel()
 	}
 	m.w.logger.Info("input worker stopped", "group_id", m.w.group.GroupID, "input_id", id)
 }

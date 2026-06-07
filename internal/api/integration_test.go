@@ -80,7 +80,7 @@ func newPGStore(t *testing.T) (*metadata.PostgresStore, *pgxpool.Pool) {
 // the store and that GET aggregates lease + runtime status correctly.
 func TestAPIIntegrationCreateAndAggregate(t *testing.T) {
 	store, _ := newPGStore(t)
-	h := New(store, nil).Handler()
+	h := New(store, nil, nil).Handler()
 	ctx := context.Background()
 	gid := "binance:spot:BTCUSDT"
 
@@ -145,7 +145,7 @@ func TestAPIIntegrationCreateAndAggregate(t *testing.T) {
 // through PostgreSQL.
 func TestAPIIntegrationPauseResume(t *testing.T) {
 	store, _ := newPGStore(t)
-	h := New(store, nil).Handler()
+	h := New(store, nil, nil).Handler()
 	ctx := context.Background()
 	gid := "binance:spot:BTCUSDT"
 

@@ -83,8 +83,9 @@ const reportTimeout = 5 * time.Second
 //
 // When consumption is enabled (storage and consumers are set), the worker also
 // runs an inputManager that spins up one inputWorker per runnable trade, kline,
-// or orderbook-delta input, consuming Kafka into PostgreSQL. With consumption
-// disabled it behaves as in M5: lease-only, reporting status but not consuming.
+// or orderbook-delta input, and one snapshotInputWorker for the
+// orderbook_snapshot input stream. With consumption disabled it behaves as in
+// M5: lease-only, reporting status but not consuming.
 type Worker struct {
 	group      model.MarketGroup
 	inputs     []model.GroupInput
@@ -102,6 +103,12 @@ type Worker struct {
 	statusReportEvery   time.Duration
 	inputReconcileEvery time.Duration
 	consumptionConfig   ConsumptionConfig
+
+	// M8 orderbook state and snapshot generation.
+	orderBook        *orderBookState
+	snapshotChan     chan snapshotResult
+	snapshotInterval time.Duration
+	stopSnapshot     chan struct{} // closed by finish() to stop the snapshot timer
 
 	mu     sync.Mutex
 	state  WorkerState
@@ -132,13 +139,32 @@ func (w *Worker) enableConsumptionWithConfig(
 	if reconcileEvery <= 0 {
 		reconcileEvery = 5 * time.Second
 	}
+	snapInterval := cfg.SnapshotInterval
+	if snapInterval <= 0 {
+		snapInterval = time.Minute // M8 default, configurable
+	}
 	w.storage = st
 	w.consumers = consumers
 	w.brokers = brokers
 	w.statusReportEvery = reportEvery
 	w.inputReconcileEvery = reconcileEvery
+	w.snapshotInterval = snapInterval
 	cfg.StatusReportEvery = reportEvery
 	cfg.InputReconcileEvery = reconcileEvery
+	cfg.SnapshotInterval = snapInterval
+
+	// Init orderbook state. snapInput is derived later when the snapshot input
+	// worker is created — until then the state is dormant.
+	snapInputID := ""
+	for _, in := range w.inputs {
+		if in.StreamKind == model.StreamKindOrderBookSnapshot {
+			snapInputID = inputID(in)
+			break
+		}
+	}
+	w.orderBook = newOrderBookState(w.group.GroupID, snapInputID)
+	w.snapshotChan = make(chan snapshotResult, 8)
+	w.stopSnapshot = make(chan struct{})
 	w.consumptionConfig = cfg
 }
 
@@ -195,6 +221,11 @@ func (w *Worker) run(ctx context.Context) {
 	if w.consumptionEnabled() {
 		im = newInputManager(w)
 		im.start()
+		// M8: snapshot generation and reference-snapshot ingest.
+		if w.orderBook != nil {
+			go w.snapshotGenerateLoop(ctx)
+			go w.snapshotReceiveLoop(ctx)
+		}
 	}
 
 	state, status, lastErr := w.leaseLoop(ctx)
@@ -303,6 +334,14 @@ func (w *Worker) State() WorkerState {
 // fresh context, because the run context may already be canceled.
 func (w *Worker) finish(state WorkerState, status, lastErr string) {
 	w.setState(state)
+	// Stop the snapshot generation loop before the final status report.
+	if w.stopSnapshot != nil {
+		select {
+		case <-w.stopSnapshot:
+		default:
+			close(w.stopSnapshot)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), reportTimeout)
 	defer cancel()
 	w.reportAll(ctx, status, lastErr)
@@ -332,4 +371,100 @@ func (w *Worker) setState(s WorkerState) {
 	w.mu.Lock()
 	w.state = s
 	w.mu.Unlock()
+}
+
+// --- M8 snapshot generation and reference ingest -------------------------
+
+// snapshotGenerateLoop periodically calls orderBookState.generateSnapshot and
+// persists the result via WriteOrderBookSnapshots. It stops when stopSnapshot
+// is closed (finish() is called) or ctx is done.
+func (w *Worker) snapshotGenerateLoop(ctx context.Context) {
+	ticker := time.NewTicker(w.snapshotInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-w.stopSnapshot:
+			return
+		case <-ticker.C:
+			if !w.orderBook.isReady() {
+				continue
+			}
+			snap := w.orderBook.generateSnapshot(time.Now().UTC())
+			if len(snap.Bids) == 0 && len(snap.Asks) == 0 {
+				continue
+			}
+			if err := w.storage.WriteOrderBookSnapshots(ctx, []model.OrderBookSnapshot{snap}); err != nil {
+				w.logger.Warn("snapshot write failed",
+					"group_id", w.group.GroupID, "err", err)
+				continue
+			}
+			w.logger.Debug("snapshot written",
+				"group_id", w.group.GroupID, "input_id", snap.InputID,
+				"bids", len(snap.Bids), "asks", len(snap.Asks))
+		}
+	}
+}
+
+// snapshotReceiveLoop reads reference snapshots from the snapshot channel
+// (fed by the snapshotInputWorker) and applies them to the orderBookState.
+// A sequence reset on a new reference snapshot is expected and idempotent.
+func (w *Worker) snapshotReceiveLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-w.stopSnapshot:
+			return
+		case result, ok := <-w.snapshotChan:
+			if !ok {
+				return
+			}
+			// Apply the reference snapshot — this discards any previous
+			// state and re-initialises the order book.
+			if err := w.orderBook.applySnapshot(result.snapshot); err != nil {
+				w.logger.Warn("reference snapshot apply error",
+					"group_id", w.group.GroupID, "err", err)
+				// The state is still replaced — continue.
+			}
+			w.logger.Info("reference snapshot applied",
+				"group_id", w.group.GroupID, "sequence", ptrVal(result.snapshot.Sequence),
+				"bids", len(result.snapshot.Bids), "asks", len(result.snapshot.Asks))
+
+			// Acknowledge application so the input worker can commit the
+			// Kafka offset safely.
+			if result.done != nil {
+				close(result.done)
+			}
+		}
+	}
+}
+
+// onDeltaApplied is the callback installed on every delta inputWorker. It is
+// called after the delta batch commits in the database but before the Kafka
+// offset is committed. A sequence gap resets the order book and waits for a
+// new reference snapshot.
+func (w *Worker) onDeltaApplied(delta model.OrderBookDelta) {
+	if w.orderBook == nil {
+		return
+	}
+	applied, err := w.orderBook.applyDelta(delta)
+	if err != nil {
+		w.logger.Error("orderbook delta apply failed — resetting state",
+			"group_id", w.group.GroupID, "err", err)
+		w.orderBook.reset()
+		return
+	}
+	if applied {
+		return
+	}
+	// Delta was buffered (book not yet ready) — this is normal.
+}
+
+func ptrVal(p *int64) int64 {
+	if p == nil {
+		return -1
+	}
+	return *p
 }

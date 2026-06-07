@@ -354,10 +354,10 @@ func (s *PostgresStorage) WriteOrderBookSnapshots(ctx context.Context, rows []mo
 		}
 		batch.Queue(
 			`INSERT INTO orderbook_snapshots
-			   (group_id, input_id, snapshot_time, sequence, depth_limit, bids, asks)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7)
+			   (group_id, input_id, snapshot_time, sequence, bids, asks)
+			 VALUES ($1, $2, $3, $4, $5, $6)
 			 ON CONFLICT (input_id, snapshot_time) DO NOTHING`,
-			r.GroupID, r.InputID, r.SnapshotTime, r.Sequence, r.DepthLimit, bids, asks,
+			r.GroupID, r.InputID, r.SnapshotTime, r.Sequence, bids, asks,
 		)
 	}
 	return s.exec(ctx, batch, "write orderbook snapshots")
@@ -606,4 +606,194 @@ func sourceOrDefault(s string) string {
 		return model.KlineSourceExchange
 	}
 	return s
+}
+
+// --- M8 query methods ----------------------------------------------------
+
+const (
+	defaultQueryLimit = 200
+	maxQueryLimit     = 1000
+)
+
+func validateQueryLimit(limit int) int {
+	if limit <= 0 {
+		return defaultQueryLimit
+	}
+	if limit > maxQueryLimit {
+		return maxQueryLimit
+	}
+	return limit
+}
+
+// QueryTrades returns trades in [from, to) ordered by event_time ascending.
+// cursor is the exclusive lower event_time bound for the next page.
+func (s *PostgresStorage) QueryTrades(
+	ctx context.Context, groupID string, from, to time.Time,
+	limit int, cursor *time.Time,
+) (QueryResult[model.Trade], error) {
+	limit = validateQueryLimit(limit)
+	fetchLimit := limit + 1
+
+	rows, err := s.pool.Query(ctx,
+		`SELECT group_id, input_id, event_time, exchange_time, local_receive_time,
+		        trade_id, raw_trade_id, price, quantity, side, is_aggregated,
+		        kafka_topic, kafka_partition, kafka_offset, schema_version, ingested_at
+		   FROM trades
+		  WHERE group_id = $1
+		    AND event_time >= $2
+		    AND event_time < $3
+		    AND ($4::timestamptz IS NULL OR event_time > $4)
+		  ORDER BY event_time ASC, id ASC
+		  LIMIT $5`,
+		groupID, from, to, cursor, fetchLimit,
+	)
+	if err != nil {
+		return QueryResult[model.Trade]{},
+			fmt.Errorf("storage: query trades: %w", err)
+	}
+	defer rows.Close()
+
+	var result QueryResult[model.Trade]
+	for rows.Next() {
+		var t model.Trade
+		if err := rows.Scan(
+			&t.GroupID, &t.InputID, &t.EventTime, &t.ExchangeTime,
+			&t.LocalReceiveTime, &t.TradeID, &t.RawTradeID,
+			&t.Price, &t.Quantity, &t.Side, &t.IsAggregated,
+			&t.KafkaTopic, &t.KafkaPartition, &t.KafkaOffset,
+			&t.SchemaVersion, &t.IngestedAt,
+		); err != nil {
+			return QueryResult[model.Trade]{},
+				fmt.Errorf("storage: query trades: scan: %w", err)
+		}
+		result.Rows = append(result.Rows, t)
+	}
+	if err := rows.Err(); err != nil {
+		return QueryResult[model.Trade]{},
+			fmt.Errorf("storage: query trades: rows: %w", err)
+	}
+
+	if len(result.Rows) > limit {
+		next := result.Rows[limit].EventTime
+		result.NextCursor = &next
+		result.Rows = result.Rows[:limit]
+	}
+	return result, nil
+}
+
+// QueryKlines returns klines in [from, to) ordered by open_time ascending.
+func (s *PostgresStorage) QueryKlines(
+	ctx context.Context, groupID string, from, to time.Time,
+	limit int, cursor *time.Time,
+) (QueryResult[model.Kline], error) {
+	limit = validateQueryLimit(limit)
+	fetchLimit := limit + 1
+
+	rows, err := s.pool.Query(ctx,
+		`SELECT group_id, input_id, source, interval, open_time, close_time,
+		        open, high, low, close, volume, quote_volume, trade_count,
+		        is_closed, revision, kafka_topic, kafka_partition, kafka_offset,
+		        updated_at
+		   FROM klines
+		  WHERE group_id = $1
+		    AND open_time >= $2
+		    AND open_time < $3
+		    AND ($4::timestamptz IS NULL OR open_time > $4)
+		  ORDER BY open_time ASC
+		  LIMIT $5`,
+		groupID, from, to, cursor, fetchLimit,
+	)
+	if err != nil {
+		return QueryResult[model.Kline]{},
+			fmt.Errorf("storage: query klines: %w", err)
+	}
+	defer rows.Close()
+
+	var result QueryResult[model.Kline]
+	for rows.Next() {
+		var k model.Kline
+		if err := rows.Scan(
+			&k.GroupID, &k.InputID, &k.Source, &k.Interval,
+			&k.OpenTime, &k.CloseTime,
+			&k.Open, &k.High, &k.Low, &k.Close,
+			&k.Volume, &k.QuoteVolume, &k.TradeCount,
+			&k.IsClosed, &k.Revision,
+			&k.KafkaTopic, &k.KafkaPartition, &k.KafkaOffset,
+			&k.UpdatedAt,
+		); err != nil {
+			return QueryResult[model.Kline]{},
+				fmt.Errorf("storage: query klines: scan: %w", err)
+		}
+		result.Rows = append(result.Rows, k)
+	}
+	if err := rows.Err(); err != nil {
+		return QueryResult[model.Kline]{},
+			fmt.Errorf("storage: query klines: rows: %w", err)
+	}
+
+	if len(result.Rows) > limit {
+		next := result.Rows[limit].OpenTime
+		result.NextCursor = &next
+		result.Rows = result.Rows[:limit]
+	}
+	return result, nil
+}
+
+// QuerySnapshots returns snapshots in [from, to) ordered by snapshot_time ascending.
+func (s *PostgresStorage) QuerySnapshots(
+	ctx context.Context, groupID string, from, to time.Time,
+	limit int, cursor *time.Time,
+) (QueryResult[model.OrderBookSnapshot], error) {
+	limit = validateQueryLimit(limit)
+	fetchLimit := limit + 1
+
+	rows, err := s.pool.Query(ctx,
+		`SELECT group_id, input_id, snapshot_time, sequence, bids, asks, created_at
+		   FROM orderbook_snapshots
+		  WHERE group_id = $1
+		    AND snapshot_time >= $2
+		    AND snapshot_time < $3
+		    AND ($4::timestamptz IS NULL OR snapshot_time > $4)
+		  ORDER BY snapshot_time ASC, snapshot_id ASC
+		  LIMIT $5`,
+		groupID, from, to, cursor, fetchLimit,
+	)
+	if err != nil {
+		return QueryResult[model.OrderBookSnapshot]{},
+			fmt.Errorf("storage: query snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	var result QueryResult[model.OrderBookSnapshot]
+	for rows.Next() {
+		var sn model.OrderBookSnapshot
+		var bidsRaw, asksRaw []byte
+		if err := rows.Scan(
+			&sn.GroupID, &sn.InputID, &sn.SnapshotTime,
+			&sn.Sequence, &bidsRaw, &asksRaw, &sn.CreatedAt,
+		); err != nil {
+			return QueryResult[model.OrderBookSnapshot]{},
+				fmt.Errorf("storage: query snapshots: scan: %w", err)
+		}
+		if err := json.Unmarshal(bidsRaw, &sn.Bids); err != nil {
+			return QueryResult[model.OrderBookSnapshot]{},
+				fmt.Errorf("storage: query snapshots: unmarshal bids: %w", err)
+		}
+		if err := json.Unmarshal(asksRaw, &sn.Asks); err != nil {
+			return QueryResult[model.OrderBookSnapshot]{},
+				fmt.Errorf("storage: query snapshots: unmarshal asks: %w", err)
+		}
+		result.Rows = append(result.Rows, sn)
+	}
+	if err := rows.Err(); err != nil {
+		return QueryResult[model.OrderBookSnapshot]{},
+			fmt.Errorf("storage: query snapshots: rows: %w", err)
+	}
+
+	if len(result.Rows) > limit {
+		next := result.Rows[limit].SnapshotTime
+		result.NextCursor = &next
+		result.Rows = result.Rows[:limit]
+	}
+	return result, nil
 }

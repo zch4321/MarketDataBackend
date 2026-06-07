@@ -17,6 +17,7 @@ coverage.*
 
 # OS / editor cruft
 .codewhale/
+.deepseek/
 .idea/
 .DS_Store
 Thumbs.db

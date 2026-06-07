@@ -112,6 +112,7 @@ func run() error {
 				Size:          cfg.OrderBookDeltaBatchSize,
 				FlushInterval: cfg.OrderBookDeltaFlushInterval,
 			},
+			SnapshotInterval: cfg.OrderBookSnapshotInterval,
 		},
 	)
 

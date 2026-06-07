@@ -12,10 +12,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"MarketDataBackend/internal/metadata"
 	"MarketDataBackend/internal/model"
+	"MarketDataBackend/internal/storage"
 )
 
 // Store is the subset of metadata.Store the API depends on. Defining it here
@@ -34,18 +36,36 @@ type Store interface {
 	ListStreamRuntimeStatus(ctx context.Context, groupID string) ([]model.StreamRuntimeStatus, error)
 }
 
-// Server hosts the control-plane HTTP handlers.
+// QueryStore is the subset of storage.MarketDataStorage needed by the query API.
+type QueryStore interface {
+	QueryTrades(
+		ctx context.Context, groupID string, from, to time.Time,
+		limit int, cursor *time.Time,
+	) (storage.QueryResult[model.Trade], error)
+	QueryKlines(
+		ctx context.Context, groupID string, from, to time.Time,
+		limit int, cursor *time.Time,
+	) (storage.QueryResult[model.Kline], error)
+	QuerySnapshots(
+		ctx context.Context, groupID string, from, to time.Time,
+		limit int, cursor *time.Time,
+	) (storage.QueryResult[model.OrderBookSnapshot], error)
+}
+
+// Server hosts the control-plane HTTP handlers including the M8 query endpoints.
 type Server struct {
 	store  Store
+	query  QueryStore
 	logger *slog.Logger
 }
 
-// New builds a Server. A nil logger falls back to slog.Default.
-func New(store Store, logger *slog.Logger) *Server {
+// New builds a Server. A nil logger falls back to slog.Default. query may be nil
+// when only the control-plane endpoints are needed (tests, minimal deployments).
+func New(store Store, query QueryStore, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{store: store, logger: logger}
+	return &Server{store: store, query: query, logger: logger}
 }
 
 // Handler returns the fully routed http.Handler. Routing uses the method-aware
@@ -61,6 +81,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /groups/{group_id}/inputs", s.handleListInputs)
 	mux.HandleFunc("POST /groups/{group_id}/inputs/{stream_key}/pause", s.handlePauseInput)
 	mux.HandleFunc("POST /groups/{group_id}/inputs/{stream_key}/resume", s.handleResumeInput)
+
+	// M8: market-data query endpoints.
+	mux.HandleFunc("GET /markets/{group_id}/trades", s.handleQueryTrades)
+	mux.HandleFunc("GET /markets/{group_id}/klines", s.handleQueryKlines)
+	mux.HandleFunc("GET /markets/{group_id}/orderbook/snapshots", s.handleQuerySnapshots)
+
 	return mux
 }
 
@@ -337,3 +363,153 @@ func (s *Server) writeStoreError(w http.ResponseWriter, err error) {
 
 // compile-time assertion that the concrete store satisfies the narrow Store.
 var _ Store = (*metadata.PostgresStore)(nil)
+
+// --- M8 query handlers ----------------------------------------------------
+
+// queryRequest holds the common query-string parameters for all market-data
+// query endpoints.
+type queryRequest struct {
+	From   string // RFC3339, required
+	To     string // RFC3339, required
+	Limit  int    // optional, default 200, max 1000
+	Cursor string // RFC3339, optional (exclusive lower bound for next page)
+}
+
+func parseQueryParams(r *http.Request) (queryRequest, error) {
+	q := r.URL.Query()
+	req := queryRequest{
+		From:   q.Get("from"),
+		To:     q.Get("to"),
+		Cursor: q.Get("cursor"),
+	}
+	if req.From == "" || req.To == "" {
+		return req, fmt.Errorf("from and to are required (RFC3339)")
+	}
+	if limitStr := q.Get("limit"); limitStr != "" {
+		v, err := strconv.Atoi(limitStr)
+		if err != nil || v < 0 {
+			return req, fmt.Errorf("limit must be a non-negative integer")
+		}
+		req.Limit = v
+	}
+	return req, nil
+}
+
+func parseTimeRange(from, to string) (time.Time, time.Time, error) {
+	f, err := time.Parse(time.RFC3339, from)
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("from: %w", err)
+	}
+	t, err := time.Parse(time.RFC3339, to)
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("to: %w", err)
+	}
+	if !t.After(f) {
+		return time.Time{}, time.Time{}, fmt.Errorf("to must be after from")
+	}
+	return f, t, nil
+}
+
+func parseCursor(cursor string) (*time.Time, error) {
+	if cursor == "" {
+		return nil, nil
+	}
+	c, err := time.Parse(time.RFC3339, cursor)
+	if err != nil {
+		return nil, fmt.Errorf("cursor: %w", err)
+	}
+	return &c, nil
+}
+
+type queryResponse struct {
+	Rows       any    `json:"rows"`
+	NextCursor string `json:"next_cursor,omitempty"`
+}
+
+func (s *Server) handleQueryTrades(w http.ResponseWriter, r *http.Request) {
+	s.handleQuery(w, r,
+		func(ctx context.Context, gid string, from, to time.Time,
+			limit int, cursor *time.Time,
+		) (any, *time.Time, error) {
+			if s.query == nil {
+				return nil, nil, fmt.Errorf("query store is not configured")
+			}
+			result, err := s.query.QueryTrades(ctx, gid, from, to, limit, cursor)
+			return result.Rows, result.NextCursor, err
+		})
+}
+
+func (s *Server) handleQueryKlines(w http.ResponseWriter, r *http.Request) {
+	s.handleQuery(w, r,
+		func(ctx context.Context, gid string, from, to time.Time,
+			limit int, cursor *time.Time,
+		) (any, *time.Time, error) {
+			if s.query == nil {
+				return nil, nil, fmt.Errorf("query store is not configured")
+			}
+			result, err := s.query.QueryKlines(ctx, gid, from, to, limit, cursor)
+			return result.Rows, result.NextCursor, err
+		})
+}
+
+func (s *Server) handleQuerySnapshots(w http.ResponseWriter, r *http.Request) {
+	s.handleQuery(w, r,
+		func(ctx context.Context, gid string, from, to time.Time,
+			limit int, cursor *time.Time,
+		) (any, *time.Time, error) {
+			if s.query == nil {
+				return nil, nil, fmt.Errorf("query store is not configured")
+			}
+			result, err := s.query.QuerySnapshots(ctx, gid, from, to, limit, cursor)
+			return result.Rows, result.NextCursor, err
+		})
+}
+
+type queryFn func(
+	ctx context.Context, gid string, from, to time.Time,
+	limit int, cursor *time.Time,
+) (rows any, nextCursor *time.Time, err error)
+
+func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request, fn queryFn) {
+	gid := r.PathValue("group_id")
+	if gid == "" {
+		badRequest(w, fmt.Errorf("group_id is required"))
+		return
+	}
+
+	params, err := parseQueryParams(r)
+	if err != nil {
+		badRequest(w, err)
+		return
+	}
+	from, to, err := parseTimeRange(params.From, params.To)
+	if err != nil {
+		badRequest(w, err)
+		return
+	}
+	cursor, err := parseCursor(params.Cursor)
+	if err != nil {
+		badRequest(w, err)
+		return
+	}
+
+	// Verify the group exists before hitting the storage layer.
+	if s.store != nil {
+		if _, err := s.store.GetGroup(r.Context(), gid); err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+	}
+
+	rows, nextCursor, err := fn(r.Context(), gid, from, to, params.Limit, cursor)
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+
+	resp := queryResponse{Rows: rows}
+	if nextCursor != nil {
+		resp.NextCursor = nextCursor.Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}

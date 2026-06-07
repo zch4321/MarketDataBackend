@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 
 	"MarketDataBackend/internal/metadata"
 	"MarketDataBackend/internal/model"
+	"MarketDataBackend/internal/storage"
 )
 
 // --- in-memory fake Store ------------------------------------------------
@@ -170,7 +172,7 @@ var _ Store = (*fakeStore)(nil)
 // --- request helpers -----------------------------------------------------
 
 func newServer(store Store) http.Handler {
-	return New(store, nil).Handler()
+	return New(store, nil, nil).Handler()
 }
 
 func do(t *testing.T, h http.Handler, method, path string, body any) *httptest.ResponseRecorder {
@@ -546,5 +548,164 @@ func TestListGroups(t *testing.T) {
 	}
 	if groups := decode[[]groupResponse](t, rec); len(groups) != 2 {
 		t.Fatalf("groups = %d, want 2", len(groups))
+	}
+}
+
+// --- M8 query handler tests -----------------------------------------------
+
+// fakeQueryStore records QueryTrades/Klines/Snapshots calls and returns
+// canned results.
+type fakeQueryStore struct {
+	trades    storage.QueryResult[model.Trade]
+	klines    storage.QueryResult[model.Kline]
+	snapshots storage.QueryResult[model.OrderBookSnapshot]
+	queryErr  error
+}
+
+func (f *fakeQueryStore) QueryTrades(
+	_ context.Context, _ string, _, _ time.Time, _ int, _ *time.Time,
+) (storage.QueryResult[model.Trade], error) {
+	return f.trades, f.queryErr
+}
+
+func (f *fakeQueryStore) QueryKlines(
+	_ context.Context, _ string, _, _ time.Time, _ int, _ *time.Time,
+) (storage.QueryResult[model.Kline], error) {
+	return f.klines, f.queryErr
+}
+
+func (f *fakeQueryStore) QuerySnapshots(
+	_ context.Context, _ string, _, _ time.Time, _ int, _ *time.Time,
+) (storage.QueryResult[model.OrderBookSnapshot], error) {
+	return f.snapshots, f.queryErr
+}
+
+func newQueryServer(store Store, query QueryStore) http.Handler {
+	return New(store, query, nil).Handler()
+}
+
+func TestQueryTrades_MissingFromTo(t *testing.T) {
+	h := newQueryServer(newFakeStore(), &fakeQueryStore{})
+	rec := do(t, h, http.MethodGet, "/markets/binance:spot:BTCUSDT/trades", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestQueryTrades_InvalidTimeRange(t *testing.T) {
+	h := newQueryServer(newFakeStore(), &fakeQueryStore{})
+	path := "/markets/binance:spot:BTCUSDT/trades?from=2023-01-01&to=2023-01-01T00:00:00Z"
+	rec := do(t, h, http.MethodGet, path, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestQueryTrades_Success(t *testing.T) {
+	store := newFakeStore()
+	_ = store.CreateGroup(context.Background(), model.MarketGroup{
+		GroupID: "binance:spot:BTCUSDT", Exchange: "binance",
+		MarketType: "spot", Symbol: "BTCUSDT", DesiredStatus: model.DesiredStatusRunning,
+	})
+	query := &fakeQueryStore{
+		trades: storage.QueryResult[model.Trade]{
+			Rows: []model.Trade{
+				{GroupID: "binance:spot:BTCUSDT", Price: "50000", Quantity: "1", Side: model.TradeSideBuy},
+			},
+		},
+	}
+	h := newQueryServer(store, query)
+	path := "/markets/binance:spot:BTCUSDT/trades?from=2023-01-01T00:00:00Z&to=2023-01-02T00:00:00Z&limit=10"
+	rec := do(t, h, http.MethodGet, path, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestQueryTrades_WithCursor(t *testing.T) {
+	store := newFakeStore()
+	_ = store.CreateGroup(context.Background(), model.MarketGroup{
+		GroupID: "g", Exchange: "g", MarketType: model.MarketTypeSpot, Symbol: "g", DesiredStatus: model.DesiredStatusRunning,
+	})
+	nextCursor := time.Unix(1700000000, 0).UTC()
+	query := &fakeQueryStore{
+		trades: storage.QueryResult[model.Trade]{
+			Rows:       []model.Trade{{GroupID: "g", Price: "1", Quantity: "1"}},
+			NextCursor: &nextCursor,
+		},
+	}
+	h := newQueryServer(store, query)
+	path := "/markets/g:spot:g/trades?from=2023-01-01T00:00:00Z&to=2023-01-02T00:00:00Z&cursor=2023-01-01T12:00:00Z"
+	rec := do(t, h, http.MethodGet, path, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	resp := decode[queryResponse](t, rec)
+	if resp.NextCursor != nextCursor.Format(time.RFC3339) {
+		t.Errorf("next_cursor = %q, want %s", resp.NextCursor, nextCursor.Format(time.RFC3339))
+	}
+}
+
+func TestQueryKlines_Success(t *testing.T) {
+	store := newFakeStore()
+	_ = store.CreateGroup(context.Background(), model.MarketGroup{
+		GroupID: "g", Exchange: "g", MarketType: model.MarketTypeSpot, Symbol: "g", DesiredStatus: model.DesiredStatusRunning,
+	})
+	query := &fakeQueryStore{
+		klines: storage.QueryResult[model.Kline]{
+			Rows: []model.Kline{{GroupID: "g", Open: "100", Close: "110"}},
+		},
+	}
+	h := newQueryServer(store, query)
+	rec := do(t, h, http.MethodGet,
+		"/markets/g:spot:g/klines?from=2023-01-01T00:00:00Z&to=2023-01-02T00:00:00Z", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestQuerySnapshots_Success(t *testing.T) {
+	store := newFakeStore()
+	_ = store.CreateGroup(context.Background(), model.MarketGroup{
+		GroupID: "g", Exchange: "g", MarketType: model.MarketTypeSpot, Symbol: "g", DesiredStatus: model.DesiredStatusRunning,
+	})
+	query := &fakeQueryStore{
+		snapshots: storage.QueryResult[model.OrderBookSnapshot]{
+			Rows: []model.OrderBookSnapshot{{
+				GroupID: "g", Bids: []model.PriceLevel{{Price: "50000"}},
+			}},
+		},
+	}
+	h := newQueryServer(store, query)
+	rec := do(t, h, http.MethodGet,
+		"/markets/g:spot:g/orderbook/snapshots?from=2023-01-01T00:00:00Z&to=2023-01-02T00:00:00Z", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestQueryEndpoint_StoreError(t *testing.T) {
+	store := newFakeStore()
+	_ = store.CreateGroup(context.Background(), model.MarketGroup{
+		GroupID: "g", Exchange: "g", MarketType: model.MarketTypeSpot, Symbol: "g", DesiredStatus: model.DesiredStatusRunning,
+	})
+	query := &fakeQueryStore{queryErr: errors.New("db down")}
+	h := newQueryServer(store, query)
+	rec := do(t, h, http.MethodGet,
+		"/markets/g:spot:g/trades?from=2023-01-01T00:00:00Z&to=2023-01-02T00:00:00Z", nil)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+}
+
+func TestQueryEndpoint_WithoutStore(t *testing.T) {
+	// Server without query store returns an error.
+	srv := New(nil, nil, nil)
+	req := httptest.NewRequest(http.MethodGet,
+		"/markets/g/trades?from=2023-01-01T00:00:00Z&to=2023-01-02T00:00:00Z", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
 	}
 }

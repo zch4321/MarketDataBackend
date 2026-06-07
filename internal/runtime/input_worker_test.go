@@ -126,6 +126,12 @@ func (w *scriptedFactWriter) LoadStreamWriteProgress(
 	return p, ok, nil
 }
 
+func (w *scriptedFactWriter) WriteOrderBookSnapshots(
+	_ context.Context, _ []model.OrderBookSnapshot,
+) error {
+	return nil
+}
+
 func progressKey(inputID string, partition int) string {
 	return fmt.Sprintf("%s/%d", inputID, partition)
 }
