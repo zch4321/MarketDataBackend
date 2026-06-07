@@ -1,8 +1,22 @@
-// Package runtime — end-to-end acceptance tests covering all 21 scenarios
-// defined in docs/postgres-implementation-plan.md §14.
+// Package runtime — M10 acceptance test covering the core PostgreSQL + in-memory
+// Kafka integration (groups, lease scheduling, trade/delta/snapshot write,
+// snapshot generation, query API, pause/resume).
 //
-// Scenarios use an in-memory Kafka broker for deterministic control and an
-// isolated PostgreSQL schema, so no Docker or real Kafka is required.
+// This is a single-process integration test, not a multi-binary E2E test:
+// Kafka uses an in-memory fake broker; HTTP uses httptest. True process-level
+// E2E (real Kafka, two binaries, non-graceful failover, K8s probes, metrics
+// validation, retention) requires a separate test harness and is out of scope
+// for this TestE2EAcceptanceScenarios suite.
+//
+// Known gaps by design:
+//   - scenario 16 (retention) — deferred to a dedicated acceptance test with
+//     partition time-travel
+//   - Kline data path — covered in unit/integration tests; omitted here
+//     because the cycle needs time-advancing to produce closed candles
+//   - non-graceful lease takeover — requires SIGKILL and is an infra-level test
+//   - query correctness and cursor pagination — covered in storage integration
+//     tests (QueryTrades/Klines/Snapshots round-trips)
+//
 // Set TEST_DATABASE_DSN to point at a running PostgreSQL.
 package runtime
 
@@ -275,6 +289,21 @@ func TestE2EAcceptanceScenarios(t *testing.T) {
 	}
 
 	// ================================================================
+	// Scenario 16 (partial): Kline data path — write and verify
+	// ================================================================
+	// Use timestamps within the query window (>= 2026-06-01).
+	// 2026-06-07T10:00:00Z in epoch milliseconds.
+	const baseMS int64 = 1780790400000
+	broker.send(klineTopic, e2eKline(2, "kline-1", baseMS, baseMS+60000, true))         // closed 1m kline
+	broker.send(klineTopic, e2eKline(3, "kline-2", baseMS+60000, baseMS+120000, false)) // open kline
+	eventually(t, 5*time.Second, func() bool {
+		return factCount(t, pool, "klines", klineInputID) >= 2
+	}, "klines should reach PostgreSQL")
+	if got := broker.commitCount(klineTopic); got < 2 {
+		t.Fatalf("kline commit count = %d, want >= 2", got)
+	}
+
+	// ================================================================
 	// Scenario 17: Snapshot + delta → orderbook reconstruction
 	// ================================================================
 	seq1000 := int64(1000)
@@ -366,18 +395,81 @@ func TestE2EAcceptanceScenarios(t *testing.T) {
 	if tradeRec.Code != http.StatusOK {
 		t.Fatalf("query trades: %d body=%s", tradeRec.Code, tradeRec.Body.String())
 	}
+	var tradeQuery struct {
+		Rows       []model.Trade `json:"rows"`
+		NextCursor string        `json:"next_cursor,omitempty"`
+	}
+	if err := json.Unmarshal(tradeRec.Body.Bytes(), &tradeQuery); err != nil {
+		t.Fatalf("decode trade query response: %v", err)
+	}
+	if len(tradeQuery.Rows) < 2 {
+		t.Fatalf("trade query rows = %d, want >= 2", len(tradeQuery.Rows))
+	}
+	t.Logf("trades query: %d rows, next_cursor=%s", len(tradeQuery.Rows), tradeQuery.NextCursor)
+
+	// Pagination: follow the cursor if present and verify no duplicate rows.
+	if tradeQuery.NextCursor != "" {
+		tradePage2 := doAPI(t, handler, http.MethodGet,
+			fmt.Sprintf("/markets/%s/trades?from=2026-06-01T00:00:00Z&to=2026-12-31T23:59:59Z&limit=10&cursor=%s",
+				groupID, tradeQuery.NextCursor), nil)
+		if tradePage2.Code != http.StatusOK {
+			t.Fatalf("query trades page 2: %d body=%s", tradePage2.Code, tradePage2.Body.String())
+		}
+		var tradePage2Resp struct {
+			Rows       []model.Trade `json:"rows"`
+			NextCursor string        `json:"next_cursor,omitempty"`
+		}
+		if err := json.Unmarshal(tradePage2.Body.Bytes(), &tradePage2Resp); err != nil {
+			t.Fatalf("decode trade page 2 response: %v", err)
+		}
+		// No row from page 1 should appear in page 2 (verify by raw_trade_id).
+		page1IDs := make(map[string]bool)
+		for _, tr := range tradeQuery.Rows {
+			page1IDs[tr.RawTradeID] = true
+		}
+		for _, tr := range tradePage2Resp.Rows {
+			if page1IDs[tr.RawTradeID] {
+				t.Fatalf("duplicate trade %q across cursor pages", tr.RawTradeID)
+			}
+		}
+		t.Logf("pagination verified: page 2 has %d rows", len(tradePage2Resp.Rows))
+	} else {
+		t.Logf("no next_cursor (all %d rows fit in one page)", len(tradeQuery.Rows))
+	}
 
 	klineRec := doAPI(t, handler, http.MethodGet,
 		fmt.Sprintf("/markets/%s/klines?from=2026-06-01T00:00:00Z&to=2026-12-31T23:59:59Z", groupID), nil)
 	if klineRec.Code != http.StatusOK {
 		t.Fatalf("query klines: %d", klineRec.Code)
 	}
+	var klineQuery struct {
+		Rows       []model.Kline `json:"rows"`
+		NextCursor string        `json:"next_cursor,omitempty"`
+	}
+	if err := json.Unmarshal(klineRec.Body.Bytes(), &klineQuery); err != nil {
+		t.Fatalf("decode kline query response: %v", err)
+	}
+	if len(klineQuery.Rows) < 2 {
+		t.Fatalf("kline query rows = %d, want >= 2", len(klineQuery.Rows))
+	}
+	t.Logf("klines query: %d rows, next_cursor=%s", len(klineQuery.Rows), klineQuery.NextCursor)
 
 	snapRec := doAPI(t, handler, http.MethodGet,
 		fmt.Sprintf("/markets/%s/orderbook/snapshots?from=2026-06-01T00:00:00Z&to=2026-12-31T23:59:59Z", groupID), nil)
 	if snapRec.Code != http.StatusOK {
 		t.Fatalf("query snapshots: %d body=%s", snapRec.Code, snapRec.Body.String())
 	}
+	var snapQuery struct {
+		Rows       []model.OrderBookSnapshot `json:"rows"`
+		NextCursor string                    `json:"next_cursor,omitempty"`
+	}
+	if err := json.Unmarshal(snapRec.Body.Bytes(), &snapQuery); err != nil {
+		t.Fatalf("decode snapshot query response: %v", err)
+	}
+	if len(snapQuery.Rows) < 1 {
+		t.Fatalf("snapshot query rows = %d, want >= 1", len(snapQuery.Rows))
+	}
+	t.Logf("snapshots query: %d rows, next_cursor=%s", len(snapQuery.Rows), snapQuery.NextCursor)
 
 	// Verify stream_runtime_status via group detail.
 	detailRec := doAPI(t, handler, http.MethodGet, "/groups/"+groupID, nil)
@@ -438,6 +530,20 @@ func e2eTrade(offset int64, rawID string) kafka.Message {
 			"event_time":"2026-06-07T10:00:00Z",
 			"raw_trade_id":%q,"price":"50000.00","quantity":"1.5","side":"buy"
 		}`, rawID)),
+	}
+}
+
+func e2eKline(offset int64, rawID string, openTimeUnix, closeTimeUnix int64, isClosed bool) kafka.Message {
+	return kafka.Message{
+		Partition: 0,
+		Offset:    offset,
+		Value: []byte(fmt.Sprintf(`{
+			"source":"exchange","interval":"1m",
+			"open_time":%d,"close_time":%d,
+			"open":"100.0","high":"200.0","low":"50.0","close":"150.0",
+			"volume":"1000.0","quote_volume":"150000.0","trade_count":42,
+			"is_closed":%t,"revision":1
+		}`, openTimeUnix, closeTimeUnix, isClosed)),
 	}
 }
 

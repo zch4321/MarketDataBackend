@@ -140,6 +140,21 @@ func (s *PostgresStore) UpdateGroupDesiredStatus(ctx context.Context, groupID, s
 	return nil
 }
 
+// DeleteGroup removes a market group and its dependent rows (inputs, leases,
+// runtime status). Fact data is left intact — this is a soft delete of the
+// metadata only.
+func (s *PostgresStore) DeleteGroup(ctx context.Context, groupID string) error {
+	ct, err := s.pool.Exec(ctx,
+		`DELETE FROM market_groups WHERE group_id = $1`, groupID)
+	if err != nil {
+		return fmt.Errorf("metadata: delete group: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return fmt.Errorf("%w: group %s", ErrNotFound, groupID)
+	}
+	return nil
+}
+
 // ListRunnableGroups returns every group whose desired_status is running. Inputs
 // are not populated; callers fetch them with ListGroupInputs when needed.
 func (s *PostgresStore) ListRunnableGroups(ctx context.Context) ([]model.MarketGroup, error) {

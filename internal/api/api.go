@@ -27,6 +27,7 @@ type Store interface {
 	ListGroups(ctx context.Context) ([]model.MarketGroup, error)
 	GetGroup(ctx context.Context, groupID string) (model.MarketGroup, error)
 	UpdateGroupDesiredStatus(ctx context.Context, groupID, status string) error
+	DeleteGroup(ctx context.Context, groupID string) error
 
 	AddInputs(ctx context.Context, groupID string, inputs []model.GroupInput) error
 	ListGroupInputs(ctx context.Context, groupID string) ([]model.GroupInput, error)
@@ -40,15 +41,15 @@ type Store interface {
 type QueryStore interface {
 	QueryTrades(
 		ctx context.Context, groupID string, from, to time.Time,
-		limit int, cursor *time.Time,
+		limit int, cursor string,
 	) (storage.QueryResult[model.Trade], error)
 	QueryKlines(
 		ctx context.Context, groupID string, from, to time.Time,
-		limit int, cursor *time.Time,
+		limit int, cursor string,
 	) (storage.QueryResult[model.Kline], error)
 	QuerySnapshots(
 		ctx context.Context, groupID string, from, to time.Time,
-		limit int, cursor *time.Time,
+		limit int, cursor string,
 	) (storage.QueryResult[model.OrderBookSnapshot], error)
 }
 
@@ -77,6 +78,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /groups/{group_id}", s.handleGetGroup)
 	mux.HandleFunc("POST /groups/{group_id}/pause", s.handlePauseGroup)
 	mux.HandleFunc("POST /groups/{group_id}/resume", s.handleResumeGroup)
+	mux.HandleFunc("POST /groups/{group_id}/disable", s.handleDisableGroup)
+	mux.HandleFunc("DELETE /groups/{group_id}", s.handleDeleteGroup)
 	mux.HandleFunc("POST /groups/{group_id}/inputs", s.handleCreateInput)
 	mux.HandleFunc("GET /groups/{group_id}/inputs", s.handleListInputs)
 	mux.HandleFunc("POST /groups/{group_id}/inputs/{stream_key}/pause", s.handlePauseInput)
@@ -174,6 +177,22 @@ func (s *Server) handlePauseGroup(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleResumeGroup(w http.ResponseWriter, r *http.Request) {
 	s.setGroupStatus(w, r, model.DesiredStatusRunning)
+}
+
+func (s *Server) handleDisableGroup(w http.ResponseWriter, r *http.Request) {
+	s.setGroupStatus(w, r, model.DesiredStatusDisabled)
+}
+
+func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
+	gid := r.PathValue("group_id")
+	if err := s.store.DeleteGroup(r.Context(), gid); err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"group_id": gid,
+		"status":   "deleted",
+	})
 }
 
 func (s *Server) setGroupStatus(w http.ResponseWriter, r *http.Request, status string) {
@@ -372,7 +391,7 @@ type queryRequest struct {
 	From   string // RFC3339, required
 	To     string // RFC3339, required
 	Limit  int    // optional, default 200, max 1000
-	Cursor string // RFC3339, optional (exclusive lower bound for next page)
+	Cursor string // composite keyset cursor, optional
 }
 
 func parseQueryParams(r *http.Request) (queryRequest, error) {
@@ -410,17 +429,6 @@ func parseTimeRange(from, to string) (time.Time, time.Time, error) {
 	return f, t, nil
 }
 
-func parseCursor(cursor string) (*time.Time, error) {
-	if cursor == "" {
-		return nil, nil
-	}
-	c, err := time.Parse(time.RFC3339, cursor)
-	if err != nil {
-		return nil, fmt.Errorf("cursor: %w", err)
-	}
-	return &c, nil
-}
-
 type queryResponse struct {
 	Rows       any    `json:"rows"`
 	NextCursor string `json:"next_cursor,omitempty"`
@@ -429,10 +437,10 @@ type queryResponse struct {
 func (s *Server) handleQueryTrades(w http.ResponseWriter, r *http.Request) {
 	s.handleQuery(w, r,
 		func(ctx context.Context, gid string, from, to time.Time,
-			limit int, cursor *time.Time,
-		) (any, *time.Time, error) {
+			limit int, cursor string,
+		) (any, string, error) {
 			if s.query == nil {
-				return nil, nil, fmt.Errorf("query store is not configured")
+				return nil, "", fmt.Errorf("query store is not configured")
 			}
 			result, err := s.query.QueryTrades(ctx, gid, from, to, limit, cursor)
 			return result.Rows, result.NextCursor, err
@@ -442,10 +450,10 @@ func (s *Server) handleQueryTrades(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleQueryKlines(w http.ResponseWriter, r *http.Request) {
 	s.handleQuery(w, r,
 		func(ctx context.Context, gid string, from, to time.Time,
-			limit int, cursor *time.Time,
-		) (any, *time.Time, error) {
+			limit int, cursor string,
+		) (any, string, error) {
 			if s.query == nil {
-				return nil, nil, fmt.Errorf("query store is not configured")
+				return nil, "", fmt.Errorf("query store is not configured")
 			}
 			result, err := s.query.QueryKlines(ctx, gid, from, to, limit, cursor)
 			return result.Rows, result.NextCursor, err
@@ -455,10 +463,10 @@ func (s *Server) handleQueryKlines(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleQuerySnapshots(w http.ResponseWriter, r *http.Request) {
 	s.handleQuery(w, r,
 		func(ctx context.Context, gid string, from, to time.Time,
-			limit int, cursor *time.Time,
-		) (any, *time.Time, error) {
+			limit int, cursor string,
+		) (any, string, error) {
 			if s.query == nil {
-				return nil, nil, fmt.Errorf("query store is not configured")
+				return nil, "", fmt.Errorf("query store is not configured")
 			}
 			result, err := s.query.QuerySnapshots(ctx, gid, from, to, limit, cursor)
 			return result.Rows, result.NextCursor, err
@@ -467,8 +475,8 @@ func (s *Server) handleQuerySnapshots(w http.ResponseWriter, r *http.Request) {
 
 type queryFn func(
 	ctx context.Context, gid string, from, to time.Time,
-	limit int, cursor *time.Time,
-) (rows any, nextCursor *time.Time, err error)
+	limit int, cursor string,
+) (rows any, nextCursor string, err error)
 
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request, fn queryFn) {
 	gid := r.PathValue("group_id")
@@ -487,11 +495,6 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request, fn queryFn)
 		badRequest(w, err)
 		return
 	}
-	cursor, err := parseCursor(params.Cursor)
-	if err != nil {
-		badRequest(w, err)
-		return
-	}
 
 	// Verify the group exists before hitting the storage layer.
 	if s.store != nil {
@@ -501,15 +504,12 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request, fn queryFn)
 		}
 	}
 
-	rows, nextCursor, err := fn(r.Context(), gid, from, to, params.Limit, cursor)
+	rows, nextCursor, err := fn(r.Context(), gid, from, to, params.Limit, params.Cursor)
 	if err != nil {
 		s.writeStoreError(w, err)
 		return
 	}
 
-	resp := queryResponse{Rows: rows}
-	if nextCursor != nil {
-		resp.NextCursor = nextCursor.Format(time.RFC3339)
-	}
+	resp := queryResponse{Rows: rows, NextCursor: nextCursor}
 	writeJSON(w, http.StatusOK, resp)
 }

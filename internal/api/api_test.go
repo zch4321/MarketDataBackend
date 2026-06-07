@@ -118,6 +118,17 @@ func (f *fakeStore) UpdateGroupDesiredStatus(_ context.Context, groupID, status 
 	return nil
 }
 
+func (f *fakeStore) DeleteGroup(_ context.Context, groupID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.groups[groupID]; !ok {
+		return fmt.Errorf("%w: %s", metadata.ErrNotFound, groupID)
+	}
+	delete(f.groups, groupID)
+	delete(f.inputs, groupID)
+	return nil
+}
+
 func (f *fakeStore) AddInputs(_ context.Context, groupID string, inputs []model.GroupInput) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -563,19 +574,19 @@ type fakeQueryStore struct {
 }
 
 func (f *fakeQueryStore) QueryTrades(
-	_ context.Context, _ string, _, _ time.Time, _ int, _ *time.Time,
+	_ context.Context, _ string, _, _ time.Time, _ int, _ string,
 ) (storage.QueryResult[model.Trade], error) {
 	return f.trades, f.queryErr
 }
 
 func (f *fakeQueryStore) QueryKlines(
-	_ context.Context, _ string, _, _ time.Time, _ int, _ *time.Time,
+	_ context.Context, _ string, _, _ time.Time, _ int, _ string,
 ) (storage.QueryResult[model.Kline], error) {
 	return f.klines, f.queryErr
 }
 
 func (f *fakeQueryStore) QuerySnapshots(
-	_ context.Context, _ string, _, _ time.Time, _ int, _ *time.Time,
+	_ context.Context, _ string, _, _ time.Time, _ int, _ string,
 ) (storage.QueryResult[model.OrderBookSnapshot], error) {
 	return f.snapshots, f.queryErr
 }
@@ -627,22 +638,22 @@ func TestQueryTrades_WithCursor(t *testing.T) {
 	_ = store.CreateGroup(context.Background(), model.MarketGroup{
 		GroupID: "g", Exchange: "g", MarketType: model.MarketTypeSpot, Symbol: "g", DesiredStatus: model.DesiredStatusRunning,
 	})
-	nextCursor := time.Unix(1700000000, 0).UTC()
+	nextCursor := "2023-11-14T22:13:20Z|42"
 	query := &fakeQueryStore{
 		trades: storage.QueryResult[model.Trade]{
 			Rows:       []model.Trade{{GroupID: "g", Price: "1", Quantity: "1"}},
-			NextCursor: &nextCursor,
+			NextCursor: nextCursor,
 		},
 	}
 	h := newQueryServer(store, query)
-	path := "/markets/g:spot:g/trades?from=2023-01-01T00:00:00Z&to=2023-01-02T00:00:00Z&cursor=2023-01-01T12:00:00Z"
+	path := "/markets/g:spot:g/trades?from=2023-01-01T00:00:00Z&to=2023-01-02T00:00:00Z&cursor=2023-01-01T12:00:00Z|1"
 	rec := do(t, h, http.MethodGet, path, nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 	resp := decode[queryResponse](t, rec)
-	if resp.NextCursor != nextCursor.Format(time.RFC3339) {
-		t.Errorf("next_cursor = %q, want %s", resp.NextCursor, nextCursor.Format(time.RFC3339))
+	if resp.NextCursor != nextCursor {
+		t.Errorf("next_cursor = %q, want %q", resp.NextCursor, nextCursor)
 	}
 }
 

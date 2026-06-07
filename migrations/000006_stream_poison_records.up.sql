@@ -12,5 +12,8 @@ CREATE TABLE IF NOT EXISTS stream_poison_records (
     recorded_at     timestamptz  NOT NULL DEFAULT now()
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_poison_input_offset
+    ON stream_poison_records (input_id, kafka_partition, kafka_offset);
+
 CREATE INDEX IF NOT EXISTS idx_poison_input_time
     ON stream_poison_records (input_id, recorded_at);

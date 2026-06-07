@@ -19,6 +19,19 @@ spec:
         app: md-stream-runtime
     spec:
       terminationGracePeriodSeconds: 30
+      initContainers:
+        - name: migrate
+          image: your-registry/market-data-backend:latest
+          args: ["-migrate"]
+          envFrom:
+            - configMapRef:
+                name: md-backend-config
+          env:
+            - name: DATABASE_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: md-backend-secret
+                  key: DATABASE_DSN
       containers:
         - name: md-stream-runtime
           image: your-registry/market-data-backend:latest
@@ -34,7 +47,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: md-backend-secret
-                  key: DB_PASSWORD
+                  key: DATABASE_DSN
             - name: MODE
               value: "stream-runtime"
             - name: POD_NAME

@@ -122,6 +122,13 @@ type inputWorker struct {
 	loadedProgress       map[int]bool
 	durableByPartition   map[int]int64
 	done                 chan struct{}
+
+	// snapshotResetSeq and snapshotResetLastUpdate are set when a delta
+	// worker restarts after a reference snapshot has been applied.  They
+	// override the stale progress loaded from the database so that
+	// continuity checking uses the snapshot's sequence as the baseline.
+	snapshotResetSeq        *int64
+	snapshotResetLastUpdate *int64
 }
 
 func newInputWorker(group model.MarketGroup, in model.GroupInput, consumer kafka.Consumer,
@@ -246,12 +253,14 @@ func (iw *inputWorker) consume(ctx context.Context) {
 			if !isRetryableStage(stage) {
 				// M10 dead-letter path: persist the raw record for audit,
 				// then commit the offset so the runtime can continue.
+				// Only commit if the poison record is durably stored;
+				// otherwise, keep the offset uncommitted for retry.
 				iw.setStatus(model.ActualStatusError, stage+": "+err.Error())
-				iw.logger.Warn(stage+" failed; poison record persisted and skipped",
+				iw.logger.Warn(stage+" failed; writing poison record",
 					"input_id", inputID(iw.input), "stream_kind", iw.input.StreamKind,
 					"offset", msg.Offset, "err", err)
 				observability.IncDecodeErrors()
-				_ = iw.storage.WritePoisonRecord(ctx, model.PoisonRecord{
+				if err := iw.storage.WritePoisonRecord(ctx, model.PoisonRecord{
 					InputID:      inputID(iw.input),
 					GroupID:      iw.group.GroupID,
 					StreamKind:   iw.input.StreamKind,
@@ -259,7 +268,14 @@ func (iw *inputWorker) consume(ctx context.Context) {
 					Offset:       msg.Offset,
 					ErrorMessage: stage + ": " + err.Error(),
 					RawPayload:   msg.Value,
-				})
+				}); err != nil {
+					iw.logger.Error("poison record write failed; offset NOT committed",
+						"offset", msg.Offset, "err", err)
+					if !sleepCtx(ctx, writeBackoff) {
+						return
+					}
+					continue
+				}
 				if err := iw.consumer.Commit(ctx, msg); err != nil {
 					iw.logger.Warn("commit poison offset failed",
 						"offset", msg.Offset, "err", err)
@@ -270,12 +286,13 @@ func (iw *inputWorker) consume(ctx context.Context) {
 			// Retryable stage (e.g. sequence gap): preserve at-least-once by
 			// keeping the offset uncommitted. The worker stops so the gap can
 			// be observed and the runtime can recover via a new reference
-			// snapshot.
+			// snapshot. Returning here exits the consume loop so the
+			// inputManager can restart the worker after the snapshot is
+			// re-established.
 			iw.setStatus(model.ActualStatusError, stage+": "+err.Error())
-			iw.logger.Warn(stage+" failed; record left uncommitted",
+			iw.logger.Warn(stage+" failed; worker exiting, record left uncommitted",
 				"input_id", inputID(iw.input), "stream_kind", iw.input.StreamKind,
 				"offset", msg.Offset, "err", err)
-			<-ctx.Done()
 			return
 		}
 		if len(pending) == 0 {
@@ -325,12 +342,25 @@ func (iw *inputWorker) ensureProgress(ctx context.Context, partition int) bool {
 				iw.committed = &off
 				iw.mu.Unlock()
 				if iw.input.StreamKind == model.StreamKindOrderBookDelta {
-					iw.lastDeltaByPartition[partition] = model.OrderBookDelta{
+					entry := model.OrderBookDelta{
 						RawEventID:   progress.LastRawEventID,
 						LastUpdateID: progress.LastUpdateID,
 						Sequence:     progress.LastSequence,
 					}
+					// After a reference snapshot, override the stale DB
+					// progress with the snapshot's sequence/lastUpdateID.
+					if iw.snapshotResetSeq != nil {
+						entry.Sequence = iw.snapshotResetSeq
+					}
+					if iw.snapshotResetLastUpdate != nil {
+						entry.LastUpdateID = iw.snapshotResetLastUpdate
+					}
+					iw.lastDeltaByPartition[partition] = entry
 				}
+				// One-shot: clear the reset values so subsequent restarts
+				// (e.g. after a process restart) use normal DB progress.
+				iw.snapshotResetSeq = nil
+				iw.snapshotResetLastUpdate = nil
 			} else {
 				iw.durableByPartition[partition] = -1
 			}
@@ -389,6 +419,13 @@ func (iw *inputWorker) prepare(msg kafka.Message) (pendingRecord, string, error)
 		}
 		advance, err := checkDeltaContinuity(previousPtr, delta)
 		if err != nil {
+			// After a reference snapshot, stale messages that precede
+			// the snapshot's continuity baseline are expected.  Skip
+			// them silently — the offset will be committed so the
+			// consumer does not get stuck on unrecoverable records.
+			if iw.snapshotResetSeq != nil || iw.snapshotResetLastUpdate != nil {
+				return pendingRecord{msg: msg, eventTime: delta.EventTime}, "", nil
+			}
 			return pendingRecord{}, "sequence", err
 		}
 		delta.RawPayload = append([]byte(nil), msg.Value...)
@@ -614,6 +651,12 @@ type inputManager struct {
 	mu        sync.Mutex
 	active    map[string]*managedInput
 	stopFlush bool
+
+	// gapExited tracks delta input workers that exited due to a sequence
+	// gap.  While an input is in this set, the reconcile loop will not
+	// restart it until a new reference snapshot has been applied to the
+	// order book (making it ready again).
+	gapExited map[string]struct{} // inputID → gap pending snapshot
 }
 
 type managedInput struct {
@@ -625,7 +668,11 @@ type managedInput struct {
 }
 
 func newInputManager(w *Worker) *inputManager {
-	return &inputManager{w: w, active: make(map[string]*managedInput)}
+	return &inputManager{
+		w:         w,
+		active:    make(map[string]*managedInput),
+		gapExited: make(map[string]struct{}),
+	}
 }
 
 // start launches the manager loop. The owning Worker stops it explicitly after
@@ -712,12 +759,48 @@ func (m *inputManager) reconcile(ctx context.Context) {
 
 	for id, in := range desired {
 		m.mu.Lock()
-		_, running := m.active[id]
+		mi, running := m.active[id]
 		m.mu.Unlock()
-		if running {
-			continue
+		if running && mi.done != nil {
+			select {
+			case <-mi.done:
+				// Worker exited (e.g. sequence gap on a delta stream);
+				// clean up so the offset stays uncommitted.
+				m.mu.Lock()
+				delete(m.active, id)
+				m.mu.Unlock()
+				running = false
+
+				// Track delta workers that exited — they need a new
+				// reference snapshot before they can restart.
+				if in.StreamKind == model.StreamKindOrderBookDelta {
+					m.mu.Lock()
+					m.gapExited[id] = struct{}{}
+					m.mu.Unlock()
+				}
+			default:
+			}
 		}
-		m.startInput(ctx, in)
+		if !running {
+			// For delta workers that exited due to a sequence gap,
+			// do NOT restart until a reference snapshot has been
+			// applied to the order book.
+			if in.StreamKind == model.StreamKindOrderBookDelta {
+				m.mu.Lock()
+				_, hasGap := m.gapExited[id]
+				m.mu.Unlock()
+				if hasGap && (m.w.orderBook == nil || !m.w.orderBook.isReady()) {
+					continue
+				}
+				// Gap resolved — the order book is ready again.
+				if hasGap {
+					m.mu.Lock()
+					delete(m.gapExited, id)
+					m.mu.Unlock()
+				}
+			}
+			m.startInput(ctx, in)
+		}
 	}
 }
 
@@ -758,6 +841,14 @@ func (m *inputManager) startInput(parent context.Context, in model.GroupInput) {
 		// M8: hook delta application into the orderBookState.
 		if in.StreamKind == model.StreamKindOrderBookDelta && m.w.orderBook != nil {
 			iw.onDeltaApplied = m.w.onDeltaApplied
+			// After a sequence gap, carry the snapshot's continuity
+			// baseline forward so stale pre-snapshot messages are
+			// skipped rather than triggering another gap exit.
+			if m.w.orderBook.isReady() {
+				seq, lastUpdate := m.w.orderBook.getSequenceAndLastUpdateID()
+				iw.snapshotResetSeq = copyInt64Ptr(seq)
+				iw.snapshotResetLastUpdate = copyInt64Ptr(lastUpdate)
+			}
 		}
 		go iw.run(ctx)
 		mi.iw = iw

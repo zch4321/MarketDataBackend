@@ -8,6 +8,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -77,11 +79,6 @@ func (s *PostgresStorage) WriteFactBatch(ctx context.Context, batch FactBatch) e
 		return nil
 	}
 
-	dbNow, err := databaseNow(ctx, tx)
-	if err != nil {
-		return fmt.Errorf("storage: write fact batch: database time: %w", err)
-	}
-
 	trades := tradesAfterOffset(batch.Trades, p, durable)
 	if err := writeTradesTx(ctx, tx, trades); err != nil {
 		return err
@@ -90,9 +87,16 @@ func (s *PostgresStorage) WriteFactBatch(ctx context.Context, batch FactBatch) e
 	if err := writeKlinesTx(ctx, tx, klines); err != nil {
 		return err
 	}
+
 	deltas := deltasAfterOffset(batch.OrderBookDeltas, p, durable)
-	if err := writeOrderBookDeltasCopy(ctx, tx, deltas, dbNow); err != nil {
-		return err
+	if len(deltas) > 0 {
+		dbNow, err := databaseNow(ctx, tx)
+		if err != nil {
+			return fmt.Errorf("storage: write fact batch: database time: %w", err)
+		}
+		if err := writeOrderBookDeltasCopy(ctx, tx, deltas, dbNow); err != nil {
+			return err
+		}
 	}
 
 	if _, err := tx.Exec(ctx,
@@ -272,7 +276,7 @@ func (s *PostgresStorage) WriteKlines(ctx context.Context, rows []model.Kline) e
 			    kafka_offset    = EXCLUDED.kafka_offset,
 			    updated_at      = now()
 			 WHERE (klines.is_closed = false AND EXCLUDED.revision >= klines.revision)
-			    OR EXCLUDED.revision > klines.revision`,
+			    OR (klines.is_closed = true AND EXCLUDED.revision > klines.revision AND EXCLUDED.is_closed = true)`,
 			r.GroupID, r.InputID, sourceOrDefault(r.Source), r.Interval, r.OpenTime, r.CloseTime,
 			r.Open, r.High, r.Low, r.Close, r.Volume, nullIfEmpty(r.QuoteVolume), r.TradeCount,
 			r.IsClosed, r.Revision, r.KafkaTopic, r.KafkaPartition, r.KafkaOffset,
@@ -514,7 +518,7 @@ func writeKlinesTx(ctx context.Context, tx pgx.Tx, rows []model.Kline) error {
 			    kafka_offset = EXCLUDED.kafka_offset,
 			    updated_at = now()
 			 WHERE (klines.is_closed = false AND EXCLUDED.revision >= klines.revision)
-			    OR EXCLUDED.revision > klines.revision`,
+			    OR (klines.is_closed = true AND EXCLUDED.revision > klines.revision AND EXCLUDED.is_closed = true)`,
 			r.GroupID, r.InputID, sourceOrDefault(r.Source), r.Interval, r.OpenTime, r.CloseTime,
 			r.Open, r.High, r.Low, r.Close, r.Volume, nullIfEmpty(r.QuoteVolume), r.TradeCount,
 			r.IsClosed, r.Revision, r.KafkaTopic, r.KafkaPartition, r.KafkaOffset,
@@ -634,6 +638,80 @@ const (
 	maxQueryLimit     = 1000
 )
 
+// --- composite keyset cursor helpers -----------------------------------
+
+// parseTradeCursor decodes a trade cursor "time|id" into its components.
+// An empty cursor returns zero values.
+func parseTradeCursor(cursor string) (time.Time, int64, error) {
+	if cursor == "" {
+		return time.Time{}, 0, nil
+	}
+	idx := strings.LastIndexByte(cursor, '|')
+	if idx < 0 {
+		return time.Time{}, 0, fmt.Errorf("invalid trade cursor: %q", cursor)
+	}
+	t, err := time.Parse(time.RFC3339Nano, cursor[:idx])
+	if err != nil {
+		return time.Time{}, 0, fmt.Errorf("invalid trade cursor time: %w", err)
+	}
+	id, err := strconv.ParseInt(cursor[idx+1:], 10, 64)
+	if err != nil {
+		return time.Time{}, 0, fmt.Errorf("invalid trade cursor id: %w", err)
+	}
+	return t, id, nil
+}
+
+// formatTradeCursor encodes a trade cursor from event_time and id.
+func formatTradeCursor(t time.Time, id int64) string {
+	return t.Format(time.RFC3339Nano) + "|" + strconv.FormatInt(id, 10)
+}
+
+// parseKlineCursor decodes a kline cursor "time|source|interval".
+func parseKlineCursor(cursor string) (time.Time, string, string, error) {
+	if cursor == "" {
+		return time.Time{}, "", "", nil
+	}
+	parts := strings.SplitN(cursor, "|", 3)
+	if len(parts) != 3 {
+		return time.Time{}, "", "", fmt.Errorf("invalid kline cursor: %q", cursor)
+	}
+	t, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil {
+		return time.Time{}, "", "", fmt.Errorf("invalid kline cursor time: %w", err)
+	}
+	return t, parts[1], parts[2], nil
+}
+
+// formatKlineCursor encodes a kline cursor from open_time, source and interval.
+func formatKlineCursor(t time.Time, source, interval string) string {
+	return t.Format(time.RFC3339Nano) + "|" + source + "|" + interval
+}
+
+// parseSnapshotCursor decodes a snapshot cursor "time|snapshot_id".
+func parseSnapshotCursor(cursor string) (time.Time, int64, error) {
+	if cursor == "" {
+		return time.Time{}, 0, nil
+	}
+	idx := strings.LastIndexByte(cursor, '|')
+	if idx < 0 {
+		return time.Time{}, 0, fmt.Errorf("invalid snapshot cursor: %q", cursor)
+	}
+	t, err := time.Parse(time.RFC3339Nano, cursor[:idx])
+	if err != nil {
+		return time.Time{}, 0, fmt.Errorf("invalid snapshot cursor time: %w", err)
+	}
+	id, err := strconv.ParseInt(cursor[idx+1:], 10, 64)
+	if err != nil {
+		return time.Time{}, 0, fmt.Errorf("invalid snapshot cursor id: %w", err)
+	}
+	return t, id, nil
+}
+
+// formatSnapshotCursor encodes a snapshot cursor from snapshot_time and snapshot_id.
+func formatSnapshotCursor(t time.Time, id int64) string {
+	return t.Format(time.RFC3339Nano) + "|" + strconv.FormatInt(id, 10)
+}
+
 func validateQueryLimit(limit int) int {
 	if limit <= 0 {
 		return defaultQueryLimit
@@ -644,27 +722,34 @@ func validateQueryLimit(limit int) int {
 	return limit
 }
 
-// QueryTrades returns trades in [from, to) ordered by event_time ascending.
-// cursor is the exclusive lower event_time bound for the next page.
+// QueryTrades returns trades in [from, to) ordered by event_time, id ascending.
+// cursor is a composite keyset "time|id" for the next page.
 func (s *PostgresStorage) QueryTrades(
 	ctx context.Context, groupID string, from, to time.Time,
-	limit int, cursor *time.Time,
+	limit int, cursor string,
 ) (QueryResult[model.Trade], error) {
 	limit = validateQueryLimit(limit)
 	fetchLimit := limit + 1
 
+	curTime, curID, err := parseTradeCursor(cursor)
+	if err != nil {
+		return QueryResult[model.Trade]{}, fmt.Errorf("storage: query trades: %w", err)
+	}
+
 	rows, err := s.pool.Query(ctx,
-		`SELECT group_id, input_id, event_time, exchange_time, local_receive_time,
+		`SELECT id, group_id, input_id, event_time, exchange_time, local_receive_time,
 		        trade_id, raw_trade_id, price, quantity, side, is_aggregated,
 		        kafka_topic, kafka_partition, kafka_offset, schema_version, ingested_at
 		   FROM trades
 		  WHERE group_id = $1
 		    AND event_time >= $2
 		    AND event_time < $3
-		    AND ($4::timestamptz IS NULL OR event_time > $4)
+		    AND ($4 = '' OR (event_time, id) > ($5::timestamptz, $6::bigint))
 		  ORDER BY event_time ASC, id ASC
-		  LIMIT $5`,
-		groupID, from, to, cursor, fetchLimit,
+		  LIMIT $7`,
+		groupID, from, to,
+		cursor, curTime, curID,
+		fetchLimit,
 	)
 	if err != nil {
 		return QueryResult[model.Trade]{},
@@ -676,11 +761,12 @@ func (s *PostgresStorage) QueryTrades(
 	for rows.Next() {
 		var t model.Trade
 		var (
+			id         int64
 			tradeID    *string
 			rawTradeID *string
 		)
 		if err := rows.Scan(
-			&t.GroupID, &t.InputID, &t.EventTime, &t.ExchangeTime,
+			&id, &t.GroupID, &t.InputID, &t.EventTime, &t.ExchangeTime,
 			&t.LocalReceiveTime, &tradeID, &rawTradeID,
 			&t.Price, &t.Quantity, &t.Side, &t.IsAggregated,
 			&t.KafkaTopic, &t.KafkaPartition, &t.KafkaOffset,
@@ -695,6 +781,7 @@ func (s *PostgresStorage) QueryTrades(
 		if rawTradeID != nil {
 			t.RawTradeID = *rawTradeID
 		}
+		t.ID = id
 		result.Rows = append(result.Rows, t)
 	}
 	if err := rows.Err(); err != nil {
@@ -703,20 +790,26 @@ func (s *PostgresStorage) QueryTrades(
 	}
 
 	if len(result.Rows) > limit {
-		next := result.Rows[limit].EventTime
-		result.NextCursor = &next
+		last := result.Rows[limit]
+		result.NextCursor = formatTradeCursor(last.EventTime, last.ID)
 		result.Rows = result.Rows[:limit]
 	}
 	return result, nil
 }
 
-// QueryKlines returns klines in [from, to) ordered by open_time ascending.
+// QueryKlines returns klines in [from, to) ordered by (open_time, source, interval) ascending.
+// cursor is a composite keyset "time|source|interval" for the next page.
 func (s *PostgresStorage) QueryKlines(
 	ctx context.Context, groupID string, from, to time.Time,
-	limit int, cursor *time.Time,
+	limit int, cursor string,
 ) (QueryResult[model.Kline], error) {
 	limit = validateQueryLimit(limit)
 	fetchLimit := limit + 1
+
+	curTime, curSource, curInterval, err := parseKlineCursor(cursor)
+	if err != nil {
+		return QueryResult[model.Kline]{}, fmt.Errorf("storage: query klines: %w", err)
+	}
 
 	rows, err := s.pool.Query(ctx,
 		`SELECT group_id, input_id, source, interval, open_time, close_time,
@@ -727,10 +820,12 @@ func (s *PostgresStorage) QueryKlines(
 		  WHERE group_id = $1
 		    AND open_time >= $2
 		    AND open_time < $3
-		    AND ($4::timestamptz IS NULL OR open_time > $4)
-		  ORDER BY open_time ASC
-		  LIMIT $5`,
-		groupID, from, to, cursor, fetchLimit,
+		    AND ($4 = '' OR (open_time, source, interval) > ($5::timestamptz, $6::text, $7::text))
+		  ORDER BY open_time ASC, source ASC, interval ASC
+		  LIMIT $8`,
+		groupID, from, to,
+		cursor, curTime, curSource, curInterval,
+		fetchLimit,
 	)
 	if err != nil {
 		return QueryResult[model.Kline]{},
@@ -761,31 +856,39 @@ func (s *PostgresStorage) QueryKlines(
 	}
 
 	if len(result.Rows) > limit {
-		next := result.Rows[limit].OpenTime
-		result.NextCursor = &next
+		last := result.Rows[limit]
+		result.NextCursor = formatKlineCursor(last.OpenTime, last.Source, last.Interval)
 		result.Rows = result.Rows[:limit]
 	}
 	return result, nil
 }
 
-// QuerySnapshots returns snapshots in [from, to) ordered by snapshot_time ascending.
+// QuerySnapshots returns snapshots in [from, to) ordered by (snapshot_time, snapshot_id) ascending.
+// cursor is a composite keyset "time|snapshot_id" for the next page.
 func (s *PostgresStorage) QuerySnapshots(
 	ctx context.Context, groupID string, from, to time.Time,
-	limit int, cursor *time.Time,
+	limit int, cursor string,
 ) (QueryResult[model.OrderBookSnapshot], error) {
 	limit = validateQueryLimit(limit)
 	fetchLimit := limit + 1
 
+	curTime, curID, err := parseSnapshotCursor(cursor)
+	if err != nil {
+		return QueryResult[model.OrderBookSnapshot]{}, fmt.Errorf("storage: query snapshots: %w", err)
+	}
+
 	rows, err := s.pool.Query(ctx,
-		`SELECT group_id, input_id, snapshot_time, sequence, bids, asks, created_at
+		`SELECT snapshot_id, group_id, input_id, snapshot_time, sequence, bids, asks, created_at
 		   FROM orderbook_snapshots
 		  WHERE group_id = $1
 		    AND snapshot_time >= $2
 		    AND snapshot_time < $3
-		    AND ($4::timestamptz IS NULL OR snapshot_time > $4)
+		    AND ($4 = '' OR (snapshot_time, snapshot_id) > ($5::timestamptz, $6::bigint))
 		  ORDER BY snapshot_time ASC, snapshot_id ASC
-		  LIMIT $5`,
-		groupID, from, to, cursor, fetchLimit,
+		  LIMIT $7`,
+		groupID, from, to,
+		cursor, curTime, curID,
+		fetchLimit,
 	)
 	if err != nil {
 		return QueryResult[model.OrderBookSnapshot]{},
@@ -798,7 +901,7 @@ func (s *PostgresStorage) QuerySnapshots(
 		var sn model.OrderBookSnapshot
 		var bidsRaw, asksRaw []byte
 		if err := rows.Scan(
-			&sn.GroupID, &sn.InputID, &sn.SnapshotTime,
+			&sn.SnapshotID, &sn.GroupID, &sn.InputID, &sn.SnapshotTime,
 			&sn.Sequence, &bidsRaw, &asksRaw, &sn.CreatedAt,
 		); err != nil {
 			return QueryResult[model.OrderBookSnapshot]{},
@@ -820,8 +923,8 @@ func (s *PostgresStorage) QuerySnapshots(
 	}
 
 	if len(result.Rows) > limit {
-		next := result.Rows[limit].SnapshotTime
-		result.NextCursor = &next
+		last := result.Rows[limit]
+		result.NextCursor = formatSnapshotCursor(last.SnapshotTime, last.SnapshotID)
 		result.Rows = result.Rows[:limit]
 	}
 	return result, nil

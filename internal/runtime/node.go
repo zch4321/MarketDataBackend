@@ -194,6 +194,8 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 		case <-ticker.C:
 			if err := n.store.HeartbeatRuntimeNode(ctx, n.cfg.NodeID, n.capacity()); err != nil {
 				n.logger.Warn("heartbeat failed", "node_id", n.cfg.NodeID, "err", err)
+			} else {
+				observability.ReportHeartbeat()
 			}
 		}
 	}

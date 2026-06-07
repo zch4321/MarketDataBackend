@@ -122,7 +122,22 @@ func run() error {
 	// M10: health / readiness / metrics server.
 	metricsReg := observability.NewRegistry(map[string]string{"service": "md-stream-runtime"})
 	observability.SetGlobalRegistry(metricsReg)
-	readyCheck := func() error { return pool.Ping(ctx) }
+	readyCheck := func() error {
+		if err := pool.Ping(ctx); err != nil {
+			return err
+		}
+		// Verify that the database schema is up to date.
+		var version int
+		if err := pool.QueryRow(ctx,
+			"SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+		).Scan(&version); err != nil {
+			return fmt.Errorf("schema version check: %w", err)
+		}
+		if version < 6 {
+			return fmt.Errorf("schema version %d, want >= 6", version)
+		}
+		return nil
+	}
 	healthMux := http.NewServeMux()
 	healthMux.Handle("/healthz", observability.HealthHandler())
 	healthMux.Handle("/readyz", observability.ReadinessHandler(readyCheck))

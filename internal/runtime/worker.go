@@ -427,8 +427,12 @@ func (w *Worker) snapshotReceiveLoop(ctx context.Context) {
 			// Apply the reference snapshot — orders are validated first.
 			// If validation fails the previous state is preserved.
 			if err := w.orderBook.applySnapshot(result.snapshot); err != nil {
-				w.logger.Warn("reference snapshot apply error — keeping previous state",
+				w.logger.Warn("reference snapshot apply error — offset NOT committed",
 					"group_id", w.group.GroupID, "err", err)
+				// Do NOT close result.done: the snapshotInputWorker will
+				// NOT commit this offset, so the message can be retried
+				// on restart (or a fixed adapter).
+				continue
 			}
 			w.logger.Debug("reference snapshot applied",
 				"group_id", w.group.GroupID, "sequence", ptrVal(result.snapshot.Sequence),

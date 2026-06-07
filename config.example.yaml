@@ -19,7 +19,7 @@ database:
   # ${DB_PASSWORD} is expanded from the environment / .env at load time, so the
   # password never lives in this committed file. Alternatively set DATABASE_DSN
   # in the environment to override this whole value.
-  dsn: "postgres://marketdata:${DB_PASSWORD}@127.0.0.1:55432/marketdata?sslmode=disable"
+  dsn: "postgres://marketdata:${DB_PASSWORD}@127.0.0.1:15432/marketdata?sslmode=disable"
   max_conns: 10
   min_conns: 0
   connect_timeout: 5s

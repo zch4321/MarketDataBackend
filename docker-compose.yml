@@ -6,7 +6,7 @@ name: market-data-backend-deepseek
 #   docker compose up -d --wait
 #
 # Run all Go tests against PostgreSQL (PowerShell):
-#   $env:TEST_DATABASE_DSN = "postgres://marketdata:marketdata@127.0.0.1:55432/marketdata?sslmode=disable"
+#   $env:TEST_DATABASE_DSN = "postgres://marketdata:marketdata@127.0.0.1:15432/marketdata?sslmode=disable"
 #   $env:TEST_KAFKA_BROKERS = "127.0.0.1:19092"
 #   $env:GOCACHE = "$PWD\.gocache"
 #   go test ./...

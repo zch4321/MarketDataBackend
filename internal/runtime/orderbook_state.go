@@ -5,7 +5,9 @@ package runtime
 
 import (
 	"fmt"
+	"math/big"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,16 +46,21 @@ type orderBookState struct {
 
 	// Buffered deltas collected before the reference snapshot arrives.
 	// They are drained once the snapshot is applied and the first
-	// contiguous delta is found.
-	pending []model.OrderBookDelta
+	// contiguous delta is found. A hard cap prevents unbounded memory
+	// growth when the reference snapshot is missing for a long time.
+	pending    []model.OrderBookDelta
+	maxPending int
 }
+
+const defaultMaxPending = 10000
 
 func newOrderBookState(groupID, snapInput string) *orderBookState {
 	return &orderBookState{
-		groupID:   groupID,
-		snapInput: snapInput,
-		bids:      make(map[string]string),
-		asks:      make(map[string]string),
+		groupID:    groupID,
+		snapInput:  snapInput,
+		bids:       make(map[string]string),
+		asks:       make(map[string]string),
+		maxPending: defaultMaxPending,
 	}
 }
 
@@ -95,6 +102,19 @@ func (s *orderBookState) applySnapshot(snap model.OrderBookSnapshot) error {
 	s.sequence = snap.Sequence
 	s.inputID = snap.InputID
 	s.ready.Store(true)
+
+	// Immediately drain any deltas buffered before the snapshot arrived.
+	// This prevents the snapshot timer from generating a snapshot that
+	// misses already-persisted delta updates (P1-3).
+	if len(s.pending) > 0 {
+		if err := s.drainPending(); err != nil {
+			// Deltas are not contiguous with the snapshot — discard
+			// the buffered batch and wait for the next delta from
+			// Kafka to restart.
+			s.pending = nil
+			return fmt.Errorf("orderbook state: drain pending after snapshot: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -108,6 +128,11 @@ func (s *orderBookState) applyDelta(delta model.OrderBookDelta) (applied bool, e
 
 	if !s.ready.Load() {
 		// Buffer deltas until a reference snapshot arrives.
+		if len(s.pending) >= s.maxPending {
+			return false, fmt.Errorf(
+				"orderbook state: pending delta buffer full (%d); waiting for reference snapshot",
+				s.maxPending)
+		}
 		s.pending = append(s.pending, delta)
 		return false, nil
 	}
@@ -273,21 +298,37 @@ type sortDir bool
 const sortDesc sortDir = false
 const sortAsc sortDir = true
 
+// levelWithPrice holds a PriceLevel together with a pre-parsed big.Float so
+// that sorting (O(n log n)) parses each price exactly once instead of once
+// per comparator invocation.
+type levelWithPrice struct {
+	level  model.PriceLevel
+	parsed *big.Float
+}
+
 func exportLevels(m map[string]string, dir sortDir) []model.PriceLevel {
-	out := make([]model.PriceLevel, 0, len(m))
+	levels := make([]levelWithPrice, 0, len(m))
 	for price, qty := range m {
 		if qty == "0" || qty == "0.0" {
 			continue
 		}
-		out = append(out, model.PriceLevel{Price: price, Quantity: qty})
+		pv, _, _ := big.ParseFloat(strings.TrimSpace(price), 10, 256, big.ToNearestEven)
+		levels = append(levels, levelWithPrice{
+			level:  model.PriceLevel{Price: price, Quantity: qty},
+			parsed: pv,
+		})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		cmp := compareNumeric(out[i].Price, out[j].Price)
+	sort.Slice(levels, func(i, j int) bool {
+		cmp := levels[i].parsed.Cmp(levels[j].parsed)
 		if dir == sortDesc {
 			return cmp > 0
 		}
 		return cmp < 0
 	})
+	out := make([]model.PriceLevel, len(levels))
+	for i, lp := range levels {
+		out[i] = lp.level
+	}
 	return out
 }
 
@@ -365,6 +406,16 @@ func validateBidAskOrder(bids, asks []model.PriceLevel) error {
 		}
 	}
 	return nil
+}
+
+// getSequenceAndLastUpdateID returns the current sequence and lastUpdateID
+// from the order book state.  Both may be nil when no snapshot has been
+// applied yet.  The caller must ensure the state is ready before relying
+// on these values (e.g. by checking isReady).
+func (s *orderBookState) getSequenceAndLastUpdateID() (*int64, *int64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return copyInt64Ptr(s.sequence), copyInt64Ptr(s.lastUpdateID)
 }
 
 func copyInt64Ptr(p *int64) *int64 {

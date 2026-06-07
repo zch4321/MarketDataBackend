@@ -12,6 +12,7 @@ import (
 type Store interface {
 	CreateGroup(ctx context.Context, g model.MarketGroup) error
 	UpdateGroupDesiredStatus(ctx context.Context, groupID string, status string) error
+	DeleteGroup(ctx context.Context, groupID string) error
 	ListRunnableGroups(ctx context.Context) ([]model.MarketGroup, error)
 	ListGroups(ctx context.Context) ([]model.MarketGroup, error)
 	GetGroup(ctx context.Context, groupID string) (model.MarketGroup, error)

@@ -21,9 +21,12 @@ type FactBatch struct {
 }
 
 // QueryResult wraps a page of results and a cursor for the next page.
+// NextCursor is a composite keyset cursor (RFC3339 + secondary key) that
+// avoids skipping rows at page boundaries or when multiple records share
+// the same timestamp.
 type QueryResult[T any] struct {
 	Rows       []T
-	NextCursor *time.Time // nil when there are no more pages
+	NextCursor string // empty when there are no more pages
 }
 
 // MarketDataStorage writes normalized market-data facts and derived metrics.
@@ -46,19 +49,19 @@ type MarketDataStorage interface {
 	WritePoisonRecord(ctx context.Context, record model.PoisonRecord) error
 
 	// M8 query methods.  All accept a mandatory time range [from, to).
-	// cursor is the exclusive lower bound for the next page (nil for the
-	// first page).  limit caps the number of rows (0 uses the default of 200).
+	// cursor is a composite keyset for the next page (empty for the first
+	// page); limit caps the number of rows (0 uses the default of 200).
 	QueryTrades(
 		ctx context.Context, groupID string, from, to time.Time,
-		limit int, cursor *time.Time,
+		limit int, cursor string,
 	) (QueryResult[model.Trade], error)
 	QueryKlines(
 		ctx context.Context, groupID string, from, to time.Time,
-		limit int, cursor *time.Time,
+		limit int, cursor string,
 	) (QueryResult[model.Kline], error)
 	QuerySnapshots(
 		ctx context.Context, groupID string, from, to time.Time,
-		limit int, cursor *time.Time,
+		limit int, cursor string,
 	) (QueryResult[model.OrderBookSnapshot], error)
 
 	Close() error

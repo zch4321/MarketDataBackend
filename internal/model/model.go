@@ -193,6 +193,7 @@ type PriceLevel struct {
 
 // Trade is a normalized trade fact row.
 type Trade struct {
+	ID               int64 // auto-increment primary key
 	GroupID          string
 	InputID          string
 	EventTime        time.Time
@@ -272,6 +273,7 @@ type StreamWriteProgress struct {
 // descending price order, asks ascending. depth_limit was removed in M8 (migration
 // 000005); internally-generated snapshots are always full-depth.
 type OrderBookSnapshot struct {
+	SnapshotID   int64 // auto-increment primary key
 	GroupID      string
 	InputID      string
 	SnapshotTime time.Time

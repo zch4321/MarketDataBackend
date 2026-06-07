@@ -185,20 +185,29 @@ func (r *Registry) serveMetrics(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(w, "# HELP %s %s\n", name, help)
 		fmt.Fprintf(w, "# TYPE %s histogram\n", name)
 		for i, upper := range h.buckets {
-			le := fmt.Sprintf(`%s_bucket%s,le="%g"`, name, labels, upper)
-			// cumulative count
 			cum := int64(0)
 			for j := 0; j <= i; j++ {
 				cum += h.counts[j]
 			}
-			fmt.Fprintf(w, "%s %d\n", le, cum)
+			lbl := histogramLabels(labels, fmt.Sprintf("%g", upper))
+			fmt.Fprintf(w, "%s_bucket%s %d\n", name, lbl, cum)
 		}
-		inf := fmt.Sprintf(`%s_bucket%s,le="+Inf"`, name, labels)
-		fmt.Fprintf(w, "%s %d\n", inf, h.total)
+		inf := histogramLabels(labels, "+Inf")
+		fmt.Fprintf(w, "%s_bucket%s %d\n", name, inf, h.total)
 		fmt.Fprintf(w, "%s_sum%s %g\n", name, labels, h.sum)
 		fmt.Fprintf(w, "%s_count%s %d\n", name, labels, h.total)
 		h.mu.Unlock()
 	}
+}
+
+// histogramLabels merges the static labels (already formatted as "{k1="v1",k2="v2"}")
+// with the bucket le label. When static labels are empty, returns just the le pair.
+func histogramLabels(staticLabels string, le string) string {
+	if staticLabels == "" {
+		return fmt.Sprintf(`{le="%s"}`, le)
+	}
+	// Insert le before the closing brace.
+	return staticLabels[:len(staticLabels)-1] + fmt.Sprintf(`,le="%s"}`, le)
 }
 
 func sortedKeys[T any](m map[string]T) []string {
@@ -328,4 +337,14 @@ func SetOwnedGroups(n int64) {
 		return
 	}
 	globalRegistry.Gauge(MetricOwnedGroups, "Number of MarketGroups currently owned by this runtime").Set(n)
+}
+
+// ReportHeartbeat sets the heartbeat age metric to zero, indicating that the
+// runtime node has just successfully heartbeated.  Consumers can monitor this
+// gauge; a value persistently > 0 or absent indicates a stale node.
+func ReportHeartbeat() {
+	if globalRegistry == nil {
+		return
+	}
+	globalRegistry.Gauge(MetricHeartbeatAgeSec, "Seconds since last successful runtime heartbeat").Set(0)
 }
