@@ -6,6 +6,8 @@ package runtime
 import (
 	"fmt"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"MarketDataBackend/internal/model"
@@ -17,7 +19,14 @@ import (
 // before the reference snapshot and applied once the snapshot's sequence can
 // be matched. Sequence gaps discard the state — a new reference snapshot is
 // required to recover.
+//
+// Concurrency: snapshotGenerateLoop (reader), snapshotReceiveLoop (writer),
+// and onDeltaApplied (writer) run in separate goroutines.  Readers acquire
+// s.mu.RLock; writers acquire s.mu.Lock.  The ready flag uses atomic.Bool
+// for the fast path used by snapshotGenerateLoop before acquiring the lock.
 type orderBookState struct {
+	mu        sync.RWMutex
+	ready     atomic.Bool
 	groupID   string
 	inputID   string
 	snapInput string // input_id of the orderbook_snapshot Kafka stream
@@ -32,9 +41,6 @@ type orderBookState struct {
 	// delta (or reference snapshot, for the initial values).
 	lastUpdateID *int64
 	sequence     *int64
-
-	// Ready is true when a reference snapshot has been applied.
-	ready bool
 
 	// Buffered deltas collected before the reference snapshot arrives.
 	// They are drained once the snapshot is applied and the first
@@ -58,7 +64,8 @@ func newOrderBookState(groupID, snapInput string) *orderBookState {
 // replaced, so an ordering violation in the upstream snapshot does not
 // overwrite a previously valid book.
 func (s *orderBookState) applySnapshot(snap model.OrderBookSnapshot) error {
-	// Validate first, so a malformed snapshot never replaces valid state.
+	// Validate before acquiring the lock — this is a pure function on the
+	// snapshot data and does not touch shared state.
 	if err := validateBidAskOrder(snap.Bids, snap.Asks); err != nil {
 		return fmt.Errorf("orderbook state: snapshot ordering: %w", err)
 	}
@@ -79,12 +86,15 @@ func (s *orderBookState) applySnapshot(snap model.OrderBookSnapshot) error {
 		asks[level.Price] = level.Quantity
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.bids = bids
 	s.asks = asks
 	s.lastUpdateID = nil
 	s.sequence = snap.Sequence
 	s.inputID = snap.InputID
-	s.ready = true
+	s.ready.Store(true)
 	return nil
 }
 
@@ -93,7 +103,10 @@ func (s *orderBookState) applySnapshot(snap model.OrderBookSnapshot) error {
 // before a reference snapshot, or not contiguous). An error is returned only
 // for a sequence gap, which the caller must treat as a fatal state reset.
 func (s *orderBookState) applyDelta(delta model.OrderBookDelta) (applied bool, err error) {
-	if !s.ready {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.ready.Load() {
 		// Buffer deltas until a reference snapshot arrives.
 		s.pending = append(s.pending, delta)
 		return false, nil
@@ -109,18 +122,23 @@ func (s *orderBookState) applyDelta(delta model.OrderBookDelta) (applied bool, e
 	return s.applyOne(delta)
 }
 
-// ready reports whether the book has a reference snapshot.
-func (s *orderBookState) isReady() bool { return s.ready }
+// isReady reports whether the book has a reference snapshot.
+// It uses the atomic flag so snapshotGenerateLoop can poll without contention.
+func (s *orderBookState) isReady() bool {
+	return s.ready.Load()
+}
 
 // reset discards all state — bids, asks, sequence cursors, buffered deltas.
 // The book returns to the "not ready" condition, waiting for a new reference
 // snapshot.
 func (s *orderBookState) reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.bids = make(map[string]string)
 	s.asks = make(map[string]string)
 	s.lastUpdateID = nil
 	s.sequence = nil
-	s.ready = false
+	s.ready.Store(false)
 	s.pending = nil
 }
 
@@ -130,24 +148,32 @@ func (s *orderBookState) reset() {
 // CreatedAt is left at its zero value — the database layer fills it via
 // DEFAULT now() for consistency with the rest of the table.
 func (s *orderBookState) generateSnapshot(at time.Time) model.OrderBookSnapshot {
+	if !s.ready.Load() {
+		return model.OrderBookSnapshot{
+			GroupID:      s.groupID,
+			InputID:      s.inputID,
+			SnapshotTime: at,
+		}
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	snap := model.OrderBookSnapshot{
 		GroupID:      s.groupID,
 		InputID:      s.inputID,
 		SnapshotTime: at,
 		Sequence:     copyInt64Ptr(s.sequence),
+		Bids:         s.exportBids(),
+		Asks:         s.exportAsks(),
 	}
-	if !s.ready {
-		// Not ready: return an empty snapshot that the caller can skip.
-		return snap
-	}
-	snap.Bids = s.exportBids()
-	snap.Asks = s.exportAsks()
 	return snap
 }
 
 // --- internal helpers ----------------------------------------------------
 
 func (s *orderBookState) applyOne(delta model.OrderBookDelta) (bool, error) {
+	// Caller holds s.mu.
 	// Sequence continuity check.
 	if err := checkSequenceMatch(s.lastUpdateID, s.sequence, delta); err != nil {
 		return false, fmt.Errorf("orderbook state: sequence gap: %w", err)
@@ -184,6 +210,7 @@ func (s *orderBookState) applyOne(delta model.OrderBookDelta) (bool, error) {
 // equal to) the reference snapshot's sequence, and looking for the first
 // contiguous delta.  Once a delta is applied, subsequent buffered deltas must
 // be contiguous.  If a gap is detected, drainPending returns an error.
+// Caller holds s.mu.
 func (s *orderBookState) drainPending() error {
 	buf := s.pending
 	s.pending = nil
@@ -227,29 +254,41 @@ func (s *orderBookState) drainPending() error {
 	return nil
 }
 
-// exportBids returns all non-zero bids sorted by price descending.
+// --- helpers (no locking) -----------------------------------------------
+
+// exportBids returns all non-zero bids sorted descending by price.
+// Caller holds at least s.mu.RLock.
 func (s *orderBookState) exportBids() []model.PriceLevel {
-	return sortLevels(s.bids, func(a, b model.PriceLevel) bool {
-		return compareNumeric(a.Price, b.Price) > 0
-	})
+	return exportLevels(s.bids, sortDesc)
 }
 
-// exportAsks returns all non-zero asks sorted by price ascending.
+// exportAsks returns all non-zero asks sorted ascending by price.
+// Caller holds at least s.mu.RLock.
 func (s *orderBookState) exportAsks() []model.PriceLevel {
-	return sortLevels(s.asks, func(a, b model.PriceLevel) bool {
-		return compareNumeric(a.Price, b.Price) < 0
-	})
+	return exportLevels(s.asks, sortAsc)
 }
 
-func sortLevels(m map[string]string, less func(a, b model.PriceLevel) bool) []model.PriceLevel {
-	levels := make([]model.PriceLevel, 0, len(m))
+type sortDir bool
+
+const sortDesc sortDir = false
+const sortAsc sortDir = true
+
+func exportLevels(m map[string]string, dir sortDir) []model.PriceLevel {
+	out := make([]model.PriceLevel, 0, len(m))
 	for price, qty := range m {
-		levels = append(levels, model.PriceLevel{Price: price, Quantity: qty})
+		if qty == "0" || qty == "0.0" {
+			continue
+		}
+		out = append(out, model.PriceLevel{Price: price, Quantity: qty})
 	}
-	sort.Slice(levels, func(i, j int) bool {
-		return less(levels[i], levels[j])
+	sort.Slice(out, func(i, j int) bool {
+		cmp := compareNumeric(out[i].Price, out[j].Price)
+		if dir == sortDesc {
+			return cmp > 0
+		}
+		return cmp < 0
 	})
-	return levels
+	return out
 }
 
 // --- sequence helpers ----------------------------------------------------

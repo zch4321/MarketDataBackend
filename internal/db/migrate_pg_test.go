@@ -44,8 +44,8 @@ func TestMigrateUpCreatesAllTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Version: %v", err)
 	}
-	if version != 4 {
-		t.Errorf("Version = %d, want 4", version)
+	if version != 6 {
+		t.Errorf("Version = %d, want 6", version)
 	}
 
 	// Up is idempotent: a second run applies nothing and keeps the version.
