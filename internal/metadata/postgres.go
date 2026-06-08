@@ -54,21 +54,22 @@ type execer interface {
 // (group_id, stream_key) or input_id returns ErrConflict; a missing parent
 // group surfaces as a foreign-key violation wrapped in ErrNotFound.
 func insertGroupInput(ctx context.Context, q execer, in model.GroupInput) error {
-	_, err := q.Exec(ctx,
+	tag, err := q.Exec(ctx,
 		`INSERT INTO group_inputs
 		   (input_id, group_id, stream_key, stream_kind, interval, enabled,
 		    kafka_cluster, kafka_topic, kafka_group_id, desired_status, schema_version)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		 ON CONFLICT DO NOTHING`,
 		in.InputID, in.GroupID, in.StreamKey, in.StreamKind, nullIfEmpty(in.Interval),
 		in.Enabled, in.KafkaCluster, in.KafkaTopic, in.KafkaGroupID,
 		in.DesiredStatus, in.SchemaVersion)
 	switch {
-	case isUniqueViolation(err):
-		return fmt.Errorf("%w: input %s already exists", ErrConflict, in.StreamKey)
 	case isForeignKeyViolation(err):
 		return fmt.Errorf("%w: group %s", ErrNotFound, in.GroupID)
 	case err != nil:
 		return fmt.Errorf("metadata: insert input %s: %w", in.StreamKey, err)
+	case tag.RowsAffected() == 0:
+		return fmt.Errorf("%w: input %s already exists", ErrConflict, in.StreamKey)
 	}
 	return nil
 }
@@ -95,18 +96,20 @@ func (s *PostgresStore) CreateGroup(ctx context.Context, g model.MarketGroup) er
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := tx.Exec(ctx,
+	tag, err := tx.Exec(ctx,
 		`INSERT INTO market_groups
 		   (group_id, exchange, market_type, symbol, base_asset, quote_asset, desired_status, weight)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		 ON CONFLICT DO NOTHING`,
 		g.GroupID, g.Exchange, g.MarketType, g.Symbol,
 		nullIfEmpty(g.BaseAsset), nullIfEmpty(g.QuoteAsset), g.DesiredStatus, g.Weight,
-	); err != nil {
-		if isUniqueViolation(err) {
-			return fmt.Errorf("%w: market group %s/%s/%s already exists",
-				ErrConflict, g.Exchange, g.MarketType, g.Symbol)
-		}
+	)
+	if err != nil {
 		return fmt.Errorf("metadata: insert group: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: market group %s/%s/%s already exists",
+			ErrConflict, g.Exchange, g.MarketType, g.Symbol)
 	}
 
 	for _, in := range g.Inputs {
@@ -640,11 +643,6 @@ func derefString(p *string) string {
 		return ""
 	}
 	return *p
-}
-
-func isUniqueViolation(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 func isForeignKeyViolation(err error) bool {

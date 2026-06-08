@@ -38,7 +38,7 @@ func TestDefaultValues(t *testing.T) {
 	if d.RuntimeMaxWeight != 100 {
 		t.Errorf("RuntimeMaxWeight = %d, want 100", d.RuntimeMaxWeight)
 	}
-	if len(d.KafkaBrokers) != 1 || d.KafkaBrokers[0] != "127.0.0.1:19092" {
+	if len(d.KafkaBrokers) != 1 || d.KafkaBrokers[0] != "127.0.0.1:19090" {
 		t.Errorf("KafkaBrokers = %v", d.KafkaBrokers)
 	}
 	if d.InputStatusReportInterval != time.Second || d.InputReconcileInterval != 2*time.Second {

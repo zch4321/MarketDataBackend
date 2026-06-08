@@ -410,3 +410,500 @@ md.<group_id>.<stream_key>
 | `orderbook state: pending delta buffer full (10000)` | 引用快照长期缺失，pending 达上限 |
 
 所有 decode/validate 错误（非 gap 类）会写入 `stream_poison_records` 表，offset 提交后继续消费。
+
+---
+
+## 5. HTTP API（控制面）
+
+系统通过 `md-control-plane` 进程暴露 RESTful HTTP API，支持市场组（MarketGroup）的生命周期管理和已持久化的行情数据查询。以下文档供 Provider 适配器／上游系统对接使用。
+
+### 5.1 端口分离
+
+| 端口 | 默认 | 用途 |
+|---|---|---|
+| `http_addr` | `:8080` | 业务 API（组管理 + 行情查询） |
+| `metrics_addr` | `:9090` | 健康检查 + 就绪检查 + Prometheus 指标 |
+
+### 5.2 通用约定
+
+- **Content-Type**: `application/json`
+- **请求 body** 使用 `json.Decoder.DisallowUnknownFields()`，未知字段返回 400。
+- **路径参数**: 使用 Go 1.22+ ServeMux 路径通配符 `{group_id}`、`{stream_key}`。
+- **`group_id`** 格式: `<exchange>:<market_type>:<symbol>`，如 `binance:spot:BTCUSDT`。
+- **`stream_key`** 格式:
+
+| stream_kind | stream_key |
+|---|---|
+| `trade` | `trade` |
+| `kline` | `kline_<interval>`，如 `kline_1m` |
+| `orderbook_delta` | `orderbook_delta` |
+| `orderbook_snapshot` | `orderbook_snapshot` |
+
+- **`desired_status`** 枚举: `running` / `paused` / `disabled`
+- **`actual_status`**（runtime 报告）枚举: `pending` / `starting` / `running` / `paused` / `error` / `stopped`
+- **`market_type`** 枚举: `spot` / `margin` / `futures` / `swap` / `option`
+
+---
+
+#### 5.2.1 Group Management
+
+##### POST /groups — 创建市场组
+
+**请求 body：**
+
+```json
+{
+  "exchange":       "binance",
+  "market_type":    "spot",
+  "symbol":         "BTCUSDT",
+  "base_asset":     "BTC",
+  "quote_asset":    "USDT",
+  "weight":         1,
+  "desired_status": "running",
+  "inputs": [
+    {
+      "stream_kind":    "trade",
+      "kafka_topic":    "md.binance.spot.BTCUSDT.trade",
+      "kafka_group_id": "my-adapter-group",
+      "kafka_cluster":  "default"
+    }
+  ]
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `exchange` | string | 是 | 交易所标识 |
+| `market_type` | string | 是 | 须为 `spot`/`margin`/`futures`/`swap`/`option` |
+| `symbol` | string | 是 | 交易对，如 `BTCUSDT` |
+| `base_asset` | string | 否 | 基础资产 |
+| `quote_asset` | string | 否 | 计价资产 |
+| `weight` | int | 否 | 负载权重，默认 1 |
+| `desired_status` | string | 否 | 默认 `running` |
+| `inputs` | array | 否 | 初始 input 列表，每个元素见 input 结构 |
+
+**响应** `201 Created`：返回完整的 groupResponse（见 GET /groups/{group_id}）。
+
+---
+
+##### GET /groups — 列出所有市场组
+
+**响应** `200 OK`：
+
+```json
+[
+  {
+    "group_id":       "binance:spot:BTCUSDT",
+    "exchange":       "binance",
+    "market_type":    "spot",
+    "symbol":         "BTCUSDT",
+    "base_asset":     "BTC",
+    "quote_asset":    "USDT",
+    "desired_status": "running",
+    "weight":         1,
+    "lease": {
+      "node_id":          "runtime-pod-1",
+      "lease_expires_at": "2026-06-08T12:00:30Z",
+      "version":          3,
+      "active":           true
+    },
+    "inputs": [
+      {
+        "input_id":       "binance:spot:BTCUSDT:trade",
+        "stream_key":     "trade",
+        "stream_kind":    "trade",
+        "kafka_topic":    "md.binance.spot.BTCUSDT.trade",
+        "kafka_group_id": "md-runtime.binance:spot:BTCUSDT.trade",
+        "desired_status": "running",
+        "runtime": {
+          "actual_status":    "running",
+          "node_id":          "runtime-pod-1",
+          "kafka_lag":        42,
+          "committed_offset": 5099,
+          "last_error":       "",
+          "updated_at":       "2026-06-08T11:59:30Z"
+        }
+      }
+    ],
+    "created_at": "2026-06-07T10:00:00Z",
+    "updated_at": "2026-06-08T11:50:00Z"
+  }
+]
+```
+
+**groupResponse 字段说明：**
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `group_id` | string | `<exchange>:<market_type>:<symbol>` |
+| `exchange` | string | |
+| `market_type` | string | |
+| `symbol` | string | |
+| `base_asset` | string | 可选 |
+| `quote_asset` | string | 可选 |
+| `desired_status` | string | 意图状态 |
+| `weight` | int | |
+| `lease` | object | 当前租约，组未被认领时为 `null` |
+| `lease.node_id` | string | 持有该组的 runtime 节点 |
+| `lease.lease_expires_at` | RFC3339 | 租约到期时间 |
+| `lease.version` | int64 | 租约版本号 |
+| `lease.active` | bool | 当前是否有效（未过期） |
+| `inputs` | array | 该组下的所有 input |
+| `inputs[].input_id` | string | `<group_id>:<stream_key>` |
+| `inputs[].stream_key` | string | |
+| `inputs[].stream_kind` | string | |
+| `inputs[].interval` | string | kline 专用 |
+| `inputs[].kafka_topic` | string | |
+| `inputs[].kafka_group_id` | string | |
+| `inputs[].desired_status` | string | |
+| `inputs[].runtime` | object | 运行时状态，未报告时为 `{"actual_status": "pending"}` |
+| `inputs[].runtime.actual_status` | string | `pending`/`starting`/`running`/`paused`/`error`/`stopped` |
+| `inputs[].runtime.node_id` | string | |
+| `inputs[].runtime.kafka_lag` | int64 | |
+| `inputs[].runtime.committed_offset` | int64 | |
+| `inputs[].runtime.last_error` | string | |
+| `inputs[].runtime.updated_at` | RFC3339 | |
+| `created_at` | RFC3339 | |
+| `updated_at` | RFC3339 | |
+
+---
+
+##### GET /groups/{group_id} — 获取单个市场组
+
+**路径参数：**
+
+| 参数 | 说明 |
+|---|---|
+| `group_id` | `binance:spot:BTCUSDT` |
+
+**响应** `200 OK`：返回单个 groupResponse（同上）。
+
+**错误**：`404 Not Found` — 组不存在。
+
+---
+
+##### POST /groups/{group_id}/pause — 暂停组
+
+将 desired_status 设为 `paused`。组内所有 input 的 runtime 节点将停止消费。
+
+**响应** `200 OK`：返回该组的 groupResponse。
+
+---
+
+##### POST /groups/{group_id}/resume — 恢复组
+
+将 desired_status 设为 `running`。
+
+**响应** `200 OK`：返回该组的 groupResponse。
+
+---
+
+##### POST /groups/{group_id}/disable — 禁用组
+
+将 desired_status 设为 `disabled`。runtime 释放租约后不再认领该组。
+
+**响应** `200 OK`：返回该组的 groupResponse。
+
+---
+
+##### DELETE /groups/{group_id} — 删除组
+
+**响应** `200 OK`：
+
+```json
+{"group_id": "binance:spot:BTCUSDT", "status": "deleted"}
+```
+
+**错误**：`404 Not Found` — 组不存在。
+
+---
+
+#### 5.2.2 Input Management
+
+##### POST /groups/{group_id}/inputs — 添加 Input
+
+**请求 body：**
+
+```json
+{
+  "stream_kind":    "kline",
+  "interval":       "1m",
+  "kafka_topic":    "md.binance.spot.BTCUSDT.kline",
+  "kafka_group_id": "my-adapter-group",
+  "kafka_cluster":  "default",
+  "desired_status": "running"
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `stream_key` | string | 互斥① | 直接指定 stream_key |
+| `stream_kind` | string | 互斥① | `trade`/`kline`/`orderbook_delta`/`orderbook_snapshot` |
+| `interval` | string | ② | kline 必填，如 `1m`/`5m`/`15m`/`30m`/`1h`/`4h`/`1d`/`1w`/`1M` |
+| `kafka_topic` | string | 是 | Kafka topic 名称 |
+| `kafka_group_id` | string | 否 | 默认 `md-runtime.<group_id>.<stream_key>` |
+| `kafka_cluster` | string | 否 | 集群标识，默认 `default` |
+| `desired_status` | string | 否 | 默认 `running` |
+
+> ① `stream_key` 和 `stream_kind` 必须填其一。两者同时提供时须保持一致。
+> ② `stream_kind=kline` 时 `interval` 必填；其他 kind 不允许带 interval。
+
+**响应** `201 Created`：返回单条 inputResponse（结构见 GET /groups/{group_id}/inputs）。
+
+**错误**：
+
+| 状态码 | 场景 |
+|---|---|
+| 400 | 缺少必填字段、stream_key 不合法、interval 冲突 |
+| 404 | group_id 不存在 |
+| 409 | stream_key 已存在 |
+
+---
+
+##### GET /groups/{group_id}/inputs — 列出 Input
+
+**响应** `200 OK`：
+
+```json
+[
+  {
+    "input_id":       "binance:spot:BTCUSDT:trade",
+    "stream_key":     "trade",
+    "stream_kind":    "trade",
+    "kafka_topic":    "md.binance.spot.BTCUSDT.trade",
+    "kafka_group_id": "md-runtime.binance:spot:BTCUSDT.trade",
+    "desired_status": "running",
+    "runtime": {
+      "actual_status":    "running",
+      "node_id":          "runtime-pod-1",
+      "kafka_lag":        42,
+      "committed_offset": 5099,
+      "last_error":       "",
+      "updated_at":       "2026-06-08T11:59:30Z"
+    }
+  }
+]
+```
+
+---
+
+##### POST /groups/{group_id}/inputs/{stream_key}/pause — 暂停 Input
+
+将指定 input 的 desired_status 设为 `paused`。
+
+**路径参数：**
+
+| 参数 | 说明 |
+|---|---|
+| `group_id` | 市场组 ID |
+| `stream_key` | `trade` / `kline_1m` / `orderbook_delta` / `orderbook_snapshot` |
+
+**响应** `200 OK`：
+
+```json
+{"group_id": "binance:spot:BTCUSDT", "stream_key": "trade", "desired_status": "paused"}
+```
+
+---
+
+##### POST /groups/{group_id}/inputs/{stream_key}/resume — 恢复 Input
+
+将指定 input 的 desired_status 设为 `running`。
+
+**响应** `200 OK`：
+
+```json
+{"group_id": "binance:spot:BTCUSDT", "stream_key": "trade", "desired_status": "running"}
+```
+
+---
+
+#### 5.2.3 Market Data Query（M8）
+
+查询端点均返回已持久化的历史行情数据。所有端点需要 `from` 和 `to` 时间范围参数。
+
+**通用查询参数（query string）：**
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `from` | string | 是 | 起始时间，RFC3339，如 `2026-06-07T10:00:00Z` |
+| `to` | string | 是 | 结束时间，RFC3339，必须晚于 `from` |
+| `limit` | int | 否 | 返回行数上限，默认 200，最大 1000 |
+| `cursor` | string | 否 | 复合 keyset 游标，用于翻页 |
+
+**通用响应格式：**
+
+```json
+{
+  "rows": [...],
+  "next_cursor": "cursor_string"
+}
+```
+
+`next_cursor` 为空字符串表示已无更多数据。
+
+---
+
+##### GET /markets/{group_id}/trades — 查询 Trades
+
+**路径参数：**
+
+| 参数 | 说明 |
+|---|---|
+| `group_id` | `binance:spot:BTCUSDT` |
+
+**响应行结构：**
+
+```json
+{
+  "id":                12345,
+  "group_id":          "binance:spot:BTCUSDT",
+  "input_id":          "binance:spot:BTCUSDT:trade",
+  "event_time":        "2026-06-07T10:00:00Z",
+  "exchange_time":     "2026-06-07T10:00:00.001Z",
+  "local_receive_time":"2026-06-07T10:00:00.002Z",
+  "trade_id":          "12345678",
+  "raw_trade_id":      "trade-001",
+  "price":             "50000.00",
+  "quantity":          "1.5",
+  "side":              "buy",
+  "is_aggregated":     false,
+  "kafka_topic":       "md.binance.spot.BTCUSDT.trade",
+  "kafka_partition":   0,
+  "kafka_offset":      5099,
+  "schema_version":    1,
+  "ingested_at":       "2026-06-07T10:00:00.003Z"
+}
+```
+
+---
+
+##### GET /markets/{group_id}/klines — 查询 Klines
+
+**路径参数：**
+
+| 参数 | 说明 |
+|---|---|
+| `group_id` | `binance:spot:BTCUSDT` |
+
+**响应行结构：**
+
+```json
+{
+  "group_id":     "binance:spot:BTCUSDT",
+  "input_id":     "binance:spot:BTCUSDT:kline_1m",
+  "source":       "exchange",
+  "interval":     "1m",
+  "open_time":    "2026-06-07T10:00:00Z",
+  "close_time":   "2026-06-07T10:01:00Z",
+  "open":         "100.0",
+  "high":         "200.0",
+  "low":          "50.0",
+  "close":        "150.0",
+  "volume":       "1000.0",
+  "quote_volume": "150000.0",
+  "trade_count":  42,
+  "is_closed":    true,
+  "revision":     1,
+  "kafka_topic":  "md.binance.spot.BTCUSDT.kline",
+  "kafka_partition": 0,
+  "kafka_offset": 300,
+  "updated_at":   "2026-06-07T10:01:00.5Z"
+}
+```
+
+---
+
+##### GET /markets/{group_id}/orderbook/snapshots — 查询 OrderBook Snapshots
+
+**路径参数：**
+
+| 参数 | 说明 |
+|---|---|
+| `group_id` | `binance:spot:BTCUSDT` |
+
+**响应行结构：**
+
+```json
+{
+  "snapshot_id":    1,
+  "group_id":       "binance:spot:BTCUSDT",
+  "input_id":       "binance:spot:BTCUSDT:orderbook_snapshot",
+  "snapshot_time":  "2026-06-07T10:00:00Z",
+  "sequence":       1000,
+  "bids": [
+    {"price": "50000.0", "quantity": "10.0"},
+    {"price": "49990.0", "quantity": "5.0"}
+  ],
+  "asks": [
+    {"price": "50005.0", "quantity": "8.0"},
+    {"price": "50010.0", "quantity": "3.0"}
+  ],
+  "created_at":     "2026-06-07T10:00:00.1Z"
+}
+```
+
+---
+
+#### 5.2.4 Telemetry
+
+以下端点监听在 `metrics_addr`（默认 `:9090`）上。
+
+##### GET /healthz — 存活检查
+
+**响应** `200 OK`：
+
+```json
+{"status": "ok"}
+```
+
+##### GET /readyz — 就绪检查
+
+检查数据库连通性并确认 schema 版本 >= 6。
+
+**响应** `200 OK`：
+
+```json
+{"status": "ready"}
+```
+
+**响应** `503 Service Unavailable`（未就绪）：
+
+```json
+{"status": "not ready", "error": "schema version 0, want >= 6"}
+```
+
+##### GET /metrics — Prometheus 指标
+
+Prometheus 文本格式（`text/plain; version=0.0.4`）。
+
+**预定义指标：**
+
+| 名称 | 类型 | 说明 |
+|---|---|---|
+| `marketdata_runtime_heartbeat_age_seconds` | gauge | 距离上次心跳的秒数 |
+| `marketdata_runtime_owned_groups` | gauge | 当前持有的市场组数量 |
+| `marketdata_runtime_processed_messages_total` | counter | 已处理的 Kafka 消息总数 |
+| `marketdata_runtime_write_errors_total` | counter | 数据库写入失败次数 |
+| `marketdata_runtime_decode_errors_total` | counter | 消息解码/校验失败次数 |
+| `marketdata_runtime_lease_renew_failures_total` | counter | 租约续期失败次数 |
+| `marketdata_storage_write_latency_ms` | histogram | 存储写入延迟（毫秒） |
+
+所有指标携带静态标签 `service="md-control-plane"` 或 `service="md-stream-runtime"`。
+
+---
+
+#### 5.2.5 通用错误响应
+
+所有错误响应格式统一为：
+
+```json
+{"error": "description"}
+```
+
+| HTTP 状态码 | 场景 |
+|---|---|
+| `400 Bad Request` | 请求 body 解析失败、缺少必填字段、字段值不合法 |
+| `404 Not Found` | group_id / stream_key 不存在 |
+| `409 Conflict` | 重复创建（exchange+market_type+symbol 已存在或 input stream_key 已存在） |
+| `500 Internal Server Error` | 服务端内部错误（不泄露详情，仅返回 `"internal error"`） |

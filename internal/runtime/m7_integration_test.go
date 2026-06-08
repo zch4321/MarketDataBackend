@@ -276,17 +276,15 @@ func TestM7PipelinesRunInParallelAndPauseIndependently(t *testing.T) {
 		t.Fatalf("delta rows after replays = %d, want 3", got)
 	}
 
-	// A genuine gap is visible and remains uncommitted.
+	// A monotonic jump is still a valid fact and should be written/committed.
 	broker.send(inputs.deltaTopic, m7Delta(4, 104, "delta-104"))
 	eventually(t, 2*time.Second, func() bool {
-		status := streamStatus(
-			t, store, inputs.groupID, model.StreamKindOrderBookDelta,
-		)
-		return status.ActualStatus == model.ActualStatusError &&
-			strings.Contains(status.LastError, "sequence gap")
-	}, "sequence gap should be reported")
-	if got := broker.commitCount(inputs.deltaTopic); got != 5 {
-		t.Fatalf("delta commits after gap = %d, want 5", got)
+		return broker.commitCount(inputs.deltaTopic) == 6 &&
+			factCount(t, pool, "orderbook_deltas", inputs.deltaID) == 4
+	}, "monotonic sequence jump should be written and committed")
+	status := streamStatus(t, store, inputs.groupID, model.StreamKindOrderBookDelta)
+	if status.ActualStatus != model.ActualStatusRunning || status.LastError != "" {
+		t.Fatalf("delta status after monotonic jump = %+v, want running without error", status)
 	}
 }
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -513,7 +512,7 @@ func TestInputWorkerWritesKlineAndCommits(t *testing.T) {
 	stopInputWorker(t, cancel, iw)
 }
 
-func TestInputWorkerSequenceGapIsNotWrittenOrCommitted(t *testing.T) {
+func TestInputWorkerMonotonicSequenceGapIsWrittenAndCommitted(t *testing.T) {
 	consumer := &scriptedConsumer{messages: []kafka.Message{
 		validDeltaMessage(0, 10),
 		validDeltaMessage(1, 12),
@@ -535,22 +534,21 @@ func TestInputWorkerSequenceGapIsNotWrittenOrCommitted(t *testing.T) {
 	go iw.run(ctx)
 
 	waitFor(t, time.Second, func() bool {
-		st := iw.snapshot(model.ActualStatusError, "")
-		return iw.StateForTest() == model.ActualStatusError &&
-			st.CommittedOffset != nil && *st.CommittedOffset == 0
-	}, "sequence gap should stop at the last good offset")
+		st := iw.snapshot(model.ActualStatusRunning, "")
+		return st.CommittedOffset != nil && *st.CommittedOffset == 1
+	}, "monotonic sequence gap should be written and committed")
 	stopInputWorker(t, cancel, iw)
 
 	_, commits, _ := consumer.counts()
 	_, _, deltas := writer.factCounts()
-	if commits != 1 || deltas != 1 {
-		t.Fatalf("commits/deltas = %d/%d, want 1/1", commits, deltas)
+	if commits != 2 || deltas != 2 {
+		t.Fatalf("commits/deltas = %d/%d, want 2/2", commits, deltas)
 	}
 	iw.mu.Lock()
 	lastErr := iw.lastErr
 	iw.mu.Unlock()
-	if !strings.Contains(lastErr, "sequence gap") {
-		t.Errorf("last_error = %q, want sequence gap", lastErr)
+	if lastErr != "" {
+		t.Errorf("last_error = %q, want empty", lastErr)
 	}
 }
 
@@ -690,7 +688,7 @@ func TestInputWorkerDurableReplayCommitsWithoutRewritingFact(t *testing.T) {
 	stopInputWorker(t, cancel, iw)
 }
 
-func TestInputWorkerSequenceGapFlushesValidBatchPrefix(t *testing.T) {
+func TestInputWorkerMonotonicSequenceGapFlushesFullBatch(t *testing.T) {
 	consumer := &scriptedConsumer{messages: []kafka.Message{
 		validDeltaMessage(0, 10),
 		validDeltaMessage(1, 11),
@@ -705,24 +703,25 @@ func TestInputWorkerSequenceGapFlushesValidBatchPrefix(t *testing.T) {
 	}
 	iw := newInputWorker(
 		group, in, consumer, writer, &memoryStatusReporter{}, "node-a",
-		time.Second, BatchConfig{Size: 10, FlushInterval: time.Hour}, discardLogger(),
+		time.Second, BatchConfig{Size: 3, FlushInterval: time.Hour}, discardLogger(),
 	)
 	ctx, cancel := context.WithCancel(context.Background())
 	go iw.run(ctx)
 
 	waitFor(t, time.Second, func() bool {
-		return iw.StateForTest() == model.ActualStatusError
-	}, "sequence gap should stop after flushing its prefix")
+		_, commits, _ := consumer.counts()
+		return commits == 1
+	}, "monotonic sequence gap should flush the full batch")
 	_, commits, _ := consumer.counts()
 	_, _, deltas := writer.factCounts()
 	calls, _ := writer.tradeSnapshot()
-	if calls != 1 || commits != 1 || deltas != 2 {
-		t.Fatalf("prefix writes/commits/deltas = %d/%d/%d, want 1/1/2",
+	if calls != 1 || commits != 1 || deltas != 3 {
+		t.Fatalf("batch writes/commits/deltas = %d/%d/%d, want 1/1/3",
 			calls, commits, deltas)
 	}
 	committed := consumer.committedMessages()
-	if len(committed) != 1 || committed[0].Offset != 1 {
-		t.Fatalf("prefix committed = %+v, want offset 1", committed)
+	if len(committed) != 1 || committed[0].Offset != 2 {
+		t.Fatalf("batch committed = %+v, want offset 2", committed)
 	}
 	stopInputWorker(t, cancel, iw)
 }

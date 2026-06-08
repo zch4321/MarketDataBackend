@@ -79,7 +79,7 @@ func Default() Config {
 		DBMinConns:       0,
 		DBConnectTimeout: 5 * time.Second,
 
-		KafkaBrokers: []string{"127.0.0.1:19092"},
+		KafkaBrokers: []string{"127.0.0.1:19090"},
 
 		RuntimeNodeID:      "",
 		RuntimeMaxGroups:   10,

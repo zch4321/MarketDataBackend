@@ -1,14 +1,13 @@
 package runtime
 
-import (
-	"fmt"
-
-	"MarketDataBackend/internal/model"
-)
+import "MarketDataBackend/internal/model"
 
 // checkDeltaContinuity validates a new delta against the last committed delta
-// for its partition. The bool reports whether the cursor should advance; an
-// adjacent replay is valid but leaves the cursor unchanged.
+// for its partition. For fact ingestion this is intentionally a monotonicity
+// gate, not a strict contiguity gate: gaps are still useful facts and should be
+// persisted, while stale/replayed records are acknowledged without advancing the
+// cursor. Strict order-book reconstruction is handled separately by
+// orderBookState.
 func checkDeltaContinuity(
 	previous *model.OrderBookDelta, current model.OrderBookDelta,
 ) (bool, error) {
@@ -19,37 +18,8 @@ func checkDeltaContinuity(
 		return false, nil
 	}
 
-	if current.PrevUpdateID != nil {
-		if terminal := deltaTerminal(previous); terminal != nil &&
-			*current.PrevUpdateID != *terminal {
-			return false, fmt.Errorf(
-				"orderbook delta sequence gap: prev_update_id=%d, want %d",
-				*current.PrevUpdateID, *terminal,
-			)
-		}
-		return true, nil
-	}
-
-	if previous.LastUpdateID != nil &&
-		current.FirstUpdateID != nil && current.LastUpdateID != nil {
-		next := *previous.LastUpdateID + 1
-		if *current.FirstUpdateID > next || *current.LastUpdateID < next {
-			return false, fmt.Errorf(
-				"orderbook delta sequence gap: update range [%d,%d] does not cover %d",
-				*current.FirstUpdateID, *current.LastUpdateID, next,
-			)
-		}
-		return true, nil
-	}
-
-	if previous.Sequence != nil && current.Sequence != nil {
-		next := *previous.Sequence + 1
-		if *current.Sequence != next {
-			return false, fmt.Errorf(
-				"orderbook delta sequence gap: sequence=%d, want %d",
-				*current.Sequence, next,
-			)
-		}
+	if prevTerminal, curTerminal := deltaTerminal(previous), deltaTerminal(&current); prevTerminal != nil && curTerminal != nil {
+		return *curTerminal > *prevTerminal, nil
 	}
 	return true, nil
 }

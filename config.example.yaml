@@ -27,7 +27,7 @@ database:
 kafka_clusters:
   default:
     brokers:
-      - "127.0.0.1:19092"
+      - "127.0.0.1:19090"
 
 runtime:
   # Leave node_id empty to auto-derive from POD_NAME / hostname at startup.
