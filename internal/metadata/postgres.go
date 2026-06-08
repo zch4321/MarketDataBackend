@@ -342,6 +342,25 @@ func (s *PostgresStore) HeartbeatRuntimeNode(ctx context.Context, nodeID string,
 	return nil
 }
 
+// UpdateRuntimeNodeStatus sets the status of a runtime node (alive/draining/dead)
+// and bumps updated_at. An unknown node returns ErrNotFound; an invalid status is
+// rejected before touching the database.
+func (s *PostgresStore) UpdateRuntimeNodeStatus(ctx context.Context, nodeID string, status string) error {
+	if !model.IsValidNodeStatus(status) {
+		return fmt.Errorf("metadata: invalid node status %q", status)
+	}
+	ct, err := s.pool.Exec(ctx,
+		`UPDATE runtime_nodes SET status = $2, updated_at = now() WHERE node_id = $1`,
+		nodeID, status)
+	if err != nil {
+		return fmt.Errorf("metadata: update runtime node status: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return fmt.Errorf("%w: runtime node %s", ErrNotFound, nodeID)
+	}
+	return nil
+}
+
 // TryAcquireGroupLease atomically grabs the lease for a group when it is free,
 // expired, or already owned by nodeID (in which case it is extended). It returns
 // false (without error) when another node holds a still-valid lease. The

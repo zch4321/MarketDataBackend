@@ -30,6 +30,10 @@ func (f *fakeNodeStore) HeartbeatRuntimeNode(context.Context, string, model.Runt
 	return nil
 }
 
+func (f *fakeNodeStore) UpdateRuntimeNodeStatus(context.Context, string, string) error {
+	return nil
+}
+
 func (f *fakeNodeStore) ListRunnableGroups(context.Context) ([]model.MarketGroup, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

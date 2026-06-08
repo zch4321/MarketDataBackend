@@ -103,6 +103,19 @@ func IsValidMarketType(s string) bool {
 	return ok
 }
 
+// NodeStatuses is the canonical set of allowed runtime node status values.
+var NodeStatuses = map[string]struct{}{
+	NodeStatusAlive:    {},
+	NodeStatusDraining: {},
+	NodeStatusDead:     {},
+}
+
+// IsValidNodeStatus reports whether s is an allowed runtime node status.
+func IsValidNodeStatus(s string) bool {
+	_, ok := NodeStatuses[s]
+	return ok
+}
+
 // MarketGroup is one market-symbol (exchange + market_type + symbol).
 type MarketGroup struct {
 	GroupID       string

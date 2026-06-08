@@ -1,7 +1,13 @@
 # K8s Deployment + Service for md-control-plane.
+#
 # The control-plane exposes two ports:
 #   8080 — REST API (groups, inputs, market-data queries)
 #   9090 — /healthz /readyz /metrics
+#
+# Before rolling out, build and push:
+#   docker build --target md-control-plane -t <registry>/md-control-plane:<tag> .
+#   docker push <registry>/md-control-plane:<tag>
+# Then replace the image field below (or use kustomize / Helm).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -22,8 +28,9 @@ spec:
       terminationGracePeriodSeconds: 30
       initContainers:
         - name: migrate
-          image: your-registry/market-data-backend:latest
-          args: ["-migrate"]
+          image: md-control-plane:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--migrate"]
           envFrom:
             - configMapRef:
                 name: md-backend-config
@@ -35,8 +42,8 @@ spec:
                   key: DATABASE_DSN
       containers:
         - name: md-control-plane
-          image: your-registry/market-data-backend:latest
-          args: ["--config", "/etc/md-backend/config.yaml"]
+          image: md-control-plane:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - name: api
               containerPort: 8080
@@ -53,7 +60,6 @@ spec:
                   key: DATABASE_DSN
             - name: MODE
               value: "control-plane"
-          # We don't mount a config.yaml; the ConfigMap env vars are sufficient.
           readinessProbe:
             httpGet:
               path: /readyz

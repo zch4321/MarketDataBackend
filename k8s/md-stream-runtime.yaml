@@ -1,6 +1,14 @@
 # K8s Deployment + Service for md-stream-runtime.
-# Runtime nodes auto-derive their node_id from POD_NAME (set via downward API).
-# They expose a single port for health/readiness/metrics (9090).
+#
+# Runtime nodes auto-derive their node_id from POD_NAME / POD_NAMESPACE (set
+# via the downward API). They expose /healthz /readyz /metrics on port 9090.
+#
+# Database migrations are NOT run here — run them once via the control-plane's
+# init container or a separate Job to avoid races when replicas > 1.
+#
+# Build and push before deploying:
+#   docker build --target md-stream-runtime -t <registry>/md-stream-runtime:<tag> .
+#   docker push <registry>/md-stream-runtime:<tag>
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -19,23 +27,10 @@ spec:
         app: md-stream-runtime
     spec:
       terminationGracePeriodSeconds: 30
-      initContainers:
-        - name: migrate
-          image: your-registry/market-data-backend:latest
-          args: ["-migrate"]
-          envFrom:
-            - configMapRef:
-                name: md-backend-config
-          env:
-            - name: DATABASE_DSN
-              valueFrom:
-                secretKeyRef:
-                  name: md-backend-secret
-                  key: DATABASE_DSN
       containers:
         - name: md-stream-runtime
-          image: your-registry/market-data-backend:latest
-          args: ["stream-runtime"]
+          image: md-stream-runtime:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - name: metrics
               containerPort: 9090

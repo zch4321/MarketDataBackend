@@ -1,0 +1,5 @@
+# Namespace for all market-data-backend resources.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: marketdata

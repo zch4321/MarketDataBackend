@@ -23,3 +23,5 @@ coverage.*
 Thumbs.db
 
 AGENTS.md
+**/.codewhale/*
+!**/.codewhale/constitution.json

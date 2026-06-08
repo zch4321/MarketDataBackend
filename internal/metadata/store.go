@@ -19,6 +19,7 @@ type Store interface {
 
 	RegisterRuntimeNode(ctx context.Context, node model.RuntimeNode) error
 	HeartbeatRuntimeNode(ctx context.Context, nodeID string, capacity model.RuntimeCapacity) error
+	UpdateRuntimeNodeStatus(ctx context.Context, nodeID string, status string) error
 
 	TryAcquireGroupLease(ctx context.Context, groupID string, nodeID string, ttl time.Duration) (bool, error)
 	RenewGroupLease(ctx context.Context, groupID string, nodeID string, ttl time.Duration) (bool, error)

@@ -63,6 +63,7 @@ func (c NodeConfig) withDefaults() NodeConfig {
 type nodeStore interface {
 	RegisterRuntimeNode(ctx context.Context, node model.RuntimeNode) error
 	HeartbeatRuntimeNode(ctx context.Context, nodeID string, capacity model.RuntimeCapacity) error
+	UpdateRuntimeNodeStatus(ctx context.Context, nodeID string, status string) error
 	ListRunnableGroups(ctx context.Context) ([]model.MarketGroup, error)
 	TryAcquireGroupLease(ctx context.Context, groupID, nodeID string, ttl time.Duration) (bool, error)
 	RenewGroupLease(ctx context.Context, groupID, nodeID string, ttl time.Duration) (bool, error)
@@ -346,11 +347,17 @@ func (n *Node) pruneDeadWorkers() {
 	}
 }
 
-// shutdown stops every remaining worker and releases its lease.
+// shutdown stops every remaining worker and releases its lease. It transitions
+// the node status through draining → dead so the control-plane API reflects the
+// real node lifecycle.
 func (n *Node) shutdown() {
+	n.updateNodeStatus(model.NodeStatusDraining)
+
 	for _, gid := range n.runningGroupIDs() {
 		n.stopWorker(gid)
 	}
+
+	n.updateNodeStatus(model.NodeStatusDead)
 	n.logger.Info("runtime node stopped", "node_id", n.cfg.NodeID)
 }
 
@@ -382,6 +389,16 @@ func (n *Node) releaseLease(groupID, action string) {
 	defer cancel()
 	if err := n.store.ReleaseGroupLease(ctx, groupID, n.cfg.NodeID); err != nil {
 		n.logger.Warn(action+" failed", "group_id", groupID, "err", err)
+	}
+}
+
+// updateNodeStatus sets the runtime node's status in the metadata store using a
+// fresh context so it works even when the node context is already canceled.
+func (n *Node) updateNodeStatus(status string) {
+	ctx, cancel := context.WithTimeout(context.Background(), n.cfg.ShutdownTimeout)
+	defer cancel()
+	if err := n.store.UpdateRuntimeNodeStatus(ctx, n.cfg.NodeID, status); err != nil {
+		n.logger.Warn("update node status failed", "node_id", n.cfg.NodeID, "status", status, "err", err)
 	}
 }
 
